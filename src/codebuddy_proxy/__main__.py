@@ -8,9 +8,9 @@ Features:
 - Robust timeout handling with async iterators
 
 Usage with uv:
-    uv run --with workbuddy2api python -m codebuddy_proxy
-    uv run --with workbuddy2api python -m codebuddy_proxy --desensitize
-    uv run --with workbuddy2api python -m codebuddy_proxy --host 0.0.0.0 --port 8787
+    uv run python -m codebuddy_proxy
+    uv run python -m codebuddy_proxy --desensitize
+    uv run python -m codebuddy_proxy --host 0.0.0.0 --port 8787
 """
 
 import argparse
@@ -126,7 +126,7 @@ def now_s() -> int:
 
 def get_runtime_info() -> dict[str, str]:
     try:
-        app_version = importlib.metadata.version("workbuddy2api")
+        app_version = importlib.metadata.version("codebuddy-proxy")
     except importlib.metadata.PackageNotFoundError:
         app_version = "unknown"
     return {
@@ -488,42 +488,40 @@ def normalize_model_format(remote_model: dict[str, Any]) -> dict[str, Any]:
     name = remote_model.get("name", model_id)
     vendor = remote_model.get("vendor", "unknown")
     
-    # 提取 token 限制（支持多种字段名）
+    # 提取 token 限制（支持多种字段名；本地配置统一用 max_input/max_output）
     max_input = (
-        remote_model.get("max_input") or 
-        remote_model.get("maxInputTokens") or
-        remote_model.get("context_window")
+        remote_model.get("max_input")
+        or remote_model.get("maxInputTokens")
+        or remote_model.get("context_window")
+        or remote_model.get("maxAllowedSize")
     )
     max_output = (
-        remote_model.get("max_output") or 
-        remote_model.get("maxOutputTokens") or
-        remote_model.get("max_context_window")
+        remote_model.get("max_output")
+        or remote_model.get("maxOutputTokens")
+        or remote_model.get("max_context_window")
     )
-    
-    # 提取能力标志
-    tool_call = (
-        remote_model.get("tool_call", False) or 
-        remote_model.get("supportsToolCall", False) or
-        remote_model.get("supportsTools", False) or
-        remote_model.get("supports_parallel_tool_calls", False)
-    )
-    images = (
-        remote_model.get("images", False) or 
-        remote_model.get("supportsImages", False)
-    )
-    reasoning = (
-        remote_model.get("reasoning", False) or
-        remote_model.get("supportsReasoning", False)
-    )
-    
+
+    # 提取能力标志（统一规范化为 bool）
+    def _flag(*keys: str) -> bool:
+        for key in keys:
+            value = remote_model.get(key)
+            if value is not None and value is not False:
+                return bool(value)
+        return False
+
+    tool_call = _flag("tool_call", "supportsToolCall", "supportsTools", "supports_parallel_tool_calls")
+    images = _flag("images", "supportsImages")
+    # reasoning 可能是 bool 或 dict（如 {"effort":"high","summary":"auto"}），统一收敛为 bool
+    reasoning = _flag("reasoning", "supportsReasoning")
+
     # 提取描述（支持中英文）
     description = (
-        remote_model.get("descriptionZh") or 
-        remote_model.get("descriptionEn") or
-        remote_model.get("description") or 
-        remote_model.get("desc")
+        remote_model.get("descriptionZh")
+        or remote_model.get("descriptionEn")
+        or remote_model.get("description")
+        or remote_model.get("desc")
     )
-    
+
     return {
         "id": model_id,
         "name": name,
@@ -644,8 +642,10 @@ def model_to_codex_format(m: dict[str, Any]) -> dict[str, Any]:
         "priority": 1,
         
         # 上下文窗口
+        # context_window = 当前生效的输入上下文（输入 token 上限）
+        # max_context_window = 模型支持的最大上下文（也应为输入 token 上限）
         "context_window": m.get("max_input"),
-        "max_context_window": m.get("max_output"),
+        "max_context_window": m.get("max_input"),
         "auto_compact_token_limit": None,
         "effective_context_window_percent": 95,
         
@@ -767,29 +767,30 @@ async def health():
 @app.get("/v1/models")
 async def list_models():
     state = get_state()
-    # 从本地配置文件加载模型列表
+    # 从本地配置文件加载模型列表（离线可靠，无需认证）
     data = load_models_from_local_config()
-    
+
     # 记录模型列表请求
     diagnostic(
         "models_list_request",
         models_count=len(data),
         source="local_config"
     )
-    
-    # 转换为 Codex 格式
-    codex_models = [model_to_codex_format(m) for m in data]
 
-    # 同时返回标准 OpenAI 格式（data）与 Codex 格式（models），客户端任选解析
+    # 标准 OpenAI 格式：/v1/models 的 data 数组（客户端按此解析）
     openai_models = [
         {
             "id": m.get("id", "unknown"),
             "object": "model",
             "created": 1720872952,
-            "owned_by": "codebuddy",
+            "owned_by": m.get("vendor") or "codebuddy",
         }
         for m in data
     ]
+
+    # 扩展：Codex 兼容的完整模型元数据（含上下文窗口、能力等）
+    codex_models = [model_to_codex_format(m) for m in data]
+
     return {"object": "list", "data": openai_models, "models": codex_models}
 
 
@@ -1717,14 +1718,14 @@ def main():
     default_log_file = pathlib.Path(
         os.getenv(
             "CODEBUDDY_PROXY_LOG_FILE",
-            str(pathlib.Path.home() / ".workbuddy2api" / "codebuddy-proxy.jsonl"),
+            str(pathlib.Path.home() / ".codebuddy-proxy" / "codebuddy-proxy.jsonl"),
         )
     ).expanduser()
     parser.add_argument(
         "--log-file",
         type=pathlib.Path,
         default=default_log_file,
-        help="记录完整请求/响应的 JSONL 文件（默认 ~/.workbuddy2api/codebuddy-proxy.jsonl）",
+        help="记录完整请求/响应的 JSONL 文件（默认 ~/.codebuddy-proxy/codebuddy-proxy.jsonl）",
     )
     parser.add_argument("--desensitize", action="store_true",
                         help="启用脱敏处理，对 system 消息中的敏感词插入零宽空格（缓解审核误拦）")
