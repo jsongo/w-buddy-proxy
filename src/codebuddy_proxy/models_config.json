@@ -32,6 +32,7 @@
       "max_output": 32000,
       "tool_call": true,
       "images": false,
+      "credits": "x1.62 credits",
       "desc": "Kimi K3"
     },
     {
@@ -42,6 +43,7 @@
       "max_output": 32000,
       "tool_call": true,
       "images": false,
+      "credits": "x0.29 credits",
       "desc": "Hy4 preview"
     },
     {
@@ -53,6 +55,7 @@
       "tool_call": true,
       "images": false,
       "reasoning": true,
+      "credits": "x0.79 credits",
       "desc": "GLM-5.3 flagship model"
     },
     {
@@ -64,6 +67,7 @@
       "tool_call": true,
       "images": false,
       "reasoning": true,
+      "credits": "x0.06 credits",
       "desc": "GLM-5.3 Flash, fast reasoning model"
     },
     {
@@ -100,6 +104,18 @@
       "vendor": "j"
     },
     {
+      "credits": "x0.05 credits",
+      "id": "hy3-lite",
+      "maxAllowedSize": 128000,
+      "maxInputTokens": 128000,
+      "maxOutputTokens": 32000,
+      "name": "Hy3-Lite",
+      "supportsImages": false,
+      "supportsReasoning": true,
+      "supportsToolCall": true,
+      "vendor": "j"
+    },
+    {
       "credits": "x2.20 credits",
       "id": "default",
       "maxAllowedSize": 56000,
@@ -111,7 +127,7 @@
       "vendor": "v"
     },
     {
-      "credits": "x0.95 credits",
+      "credits": "x0.71 credits",
       "descriptionEn": "Native Multimodal Model",
       "descriptionZh": "原生多模态模型",
       "id": "glm-5v-turbo",
@@ -407,7 +423,7 @@
       "vendor": "f"
     },
     {
-      "credits": "x0.05 credits",
+      "credits": "x0.17 credits",
       "descriptionEn": "DeepSeek flagship model, supporting 1M context window",
       "descriptionZh": "DeepSeek 旗舰模型,支持 1M 上下文窗口",
       "id": "deepseek-v4-flash",
@@ -431,7 +447,7 @@
       "vendor": "f"
     },
     {
-      "credits": "x0.13 credits",
+      "credits": "x0.51 credits",
       "descriptionEn": "DeepSeek flagship model, supporting 1M context window",
       "descriptionZh": "DeepSeek 旗舰模型,支持 1M 上下文窗口",
       "id": "deepseek-v4-pro",

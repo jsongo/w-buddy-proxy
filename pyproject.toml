@@ -1,5 +1,5 @@
 [project]
-name = "codebuddy-proxy"
+name = "w-buddy-proxy"
 version = "2.0.4"
 description = "Local OpenAI/Responses/Anthropic compatible proxy for CodeBuddy"
 readme = "README.md"
@@ -17,6 +17,7 @@ dev = [
 ]
 
 [project.scripts]
+w-buddy-proxy = "codebuddy_proxy.__main__:main"
 codebuddy-proxy = "codebuddy_proxy.__main__:main"
 
 [build-system]

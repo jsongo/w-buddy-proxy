@@ -36,7 +36,58 @@ uv run python -m codebuddy_proxy --login --desensitize
 
 默认监听 `http://127.0.0.1:8787`。
 
-> 仓库自带的 `start.sh`：`uv run python -m codebuddy_proxy --desensitize --port 8787`
+### 用 `proxy.sh` 后台管理（推荐）
+
+常驻后台运行时不用阻塞终端：
+
+```bash
+./proxy.sh start          # 后台启动，立刻返回
+./proxy.sh stop           # 停止
+./proxy.sh restart        # 重启
+./proxy.sh status         # 显示 PID 和监听地址
+./proxy.sh logs           # tail -F 日志
+
+# 自定义 host / port / 额外参数
+./proxy.sh start -p 9000 -H 0.0.0.0
+PROXY_PORT=9000 PROXY_EXTRA_ARGS="--desensitize --optimize-context" ./proxy.sh start
+```
+
+脚本行为：
+- 自动检测 `.venv/bin/python`（优先使用项目 venv）
+- 用 `nohup ... &` 启动，`start` 命令**立即返回**，不会阻塞终端
+- PID 写到 `~/.codebuddy-proxy/proxy.pid`，日志写到 `~/.codebuddy-proxy/proxy.log`
+- 停止用 `kill` 优雅退出；10s 内未退出会 fallback 到 `kill -9`
+
+## 模型列表
+
+`src/codebuddy_proxy/models_config.json` 维护了完整的静态模型列表，加 `--static-models` 可强制使用它（断网或远程同步失败时很有用）：
+
+```bash
+./proxy.sh start -- --static-models
+# (注意中间的 `--` 分隔，把参数透传给 codebuddy_proxy)
+```
+
+静态目录包含 28 个模型，`GET /v1/models` 的 `data[].credits` / `models[].credits` 会返回积分倍率（消费 × 倍率）：
+
+| id | name | credits |
+|---|---|---|
+| `auto` | Auto（快速 / 均衡 / 极致 → 0.21 / 0.65 / 1.20） | 动态 |
+| `glm-5.3` | GLM-5.3 | x0.79 |
+| `glm-5.3-flash` | GLM-5.3-Flash | x0.06 |
+| `glm-5.2` | GLM-5.2 | x0.79 |
+| `glm-5.1` | GLM-5.1 | x0.79 |
+| `glm-5v-turbo` | GLM-5v-Turbo | x0.71 |
+| `hy3` | Hy3（限时免费） | x0.00 |
+| `hy3-lite` | Hy3-Lite | x0.05 |
+| `hy4-preview` | Hy4 preview | x0.29 |
+| `minimax-m3` | MiniMax-M3 | x0.25 |
+| `kimi-k3` / `kimi-k3-1` | Kimi-K3 | x1.62 |
+| `kimi-k2.7` | Kimi-K2.7-Code | x0.57 |
+| `kimi-k2.6` | Kimi-K2.6 | x0.52 |
+| `deepseek-v4-flash` | Deepseek-V4-Flash | x0.17 |
+| `deepseek-v4-pro` | Deepseek-V4-Pro | x0.51 |
+
+要新增 / 调整模型，直接编辑 `src/codebuddy_proxy/models_config.json`，加 `--static-models` 重启即生效。
 
 ## 快速验证
 

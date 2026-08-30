@@ -28,6 +28,59 @@ uv sync
 uv run python -m codebuddy_proxy --desensitize
 ```
 
+Or use the convenient management script `proxy.sh` (recommended for background use):
+
+```bash
+./proxy.sh start          # foreground-friendly start (background, no blocking)
+./proxy.sh stop           # stop the running instance
+./proxy.sh restart        # restart (with the same args)
+./proxy.sh status         # show PID and listening address
+./proxy.sh logs           # tail -F the log file
+
+# customize host / port / args
+./proxy.sh start -p 9000 -H 0.0.0.0
+PROXY_PORT=9000 PROXY_EXTRA_ARGS="--desensitize --optimize-context" ./proxy.sh start
+```
+
+The script:
+- Detects `.venv/bin/python` automatically (preferring the project venv).
+- Uses `nohup ... &` so `start` returns immediately — terminal is **not** blocked.
+- Writes the PID to `~/.codebuddy-proxy/proxy.pid` and logs to `~/.codebuddy-proxy/proxy.log`.
+- Stops cleanly with `kill`; falls back to `kill -9` after 10s if the process doesn't exit.
+
+---
+
+## Models
+
+Both static (`src/codebuddy_proxy/models_config.json`) and remote model lists are supported. Use `--static-models` to force the built-in list (useful when offline or behind an unsynced remote):
+
+```bash
+./proxy.sh start -- --static-models
+# (note the `--` separator so proxy.sh passes it through)
+```
+
+The static catalog includes 28 models with credits (multiplier × base cost). Sample credits shown by `GET /v1/models` → `data[].credits` / `models[].credits`:
+
+| id | name | credits |
+|---|---|---|
+| `auto` | Auto (fast / balanced / ultimate → 0.21 / 0.65 / 1.20) | dynamic |
+| `glm-5.3` | GLM-5.3 | x0.79 |
+| `glm-5.3-flash` | GLM-5.3-Flash | x0.06 |
+| `glm-5.2` | GLM-5.2 | x0.79 |
+| `glm-5.1` | GLM-5.1 | x0.79 |
+| `glm-5v-turbo` | GLM-5v-Turbo | x0.71 |
+| `hy3` | Hy3 (限时免费) | x0.00 |
+| `hy3-lite` | Hy3-Lite | x0.05 |
+| `hy4-preview` | Hy4 preview | x0.29 |
+| `minimax-m3` | MiniMax-M3 | x0.25 |
+| `kimi-k3` / `kimi-k3-1` | Kimi-K3 | x1.62 |
+| `kimi-k2.7` | Kimi-K2.7-Code | x0.57 |
+| `kimi-k2.6` | Kimi-K2.6 | x0.52 |
+| `deepseek-v4-flash` | Deepseek-V4-Flash | x0.17 |
+| `deepseek-v4-pro` | Deepseek-V4-Pro | x0.51 |
+
+Edit `src/codebuddy_proxy/models_config.json` to add or tweak entries — the static list is loaded at startup when `--static-models` is passed (or when remote fetch fails).
+
 First-time login (opens a browser):
 
 ```bash

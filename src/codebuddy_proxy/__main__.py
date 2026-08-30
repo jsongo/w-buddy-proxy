@@ -617,8 +617,13 @@ def model_to_codex_format(m: dict[str, Any]) -> dict[str, Any]:
         # 基础标识
         "id": m["id"],
         "slug": m["id"],
+        "name": m.get("name", m["id"]),
         "display_name": m.get("name", m["id"]),
         "description": m.get("desc"),
+        "description_en": m.get("descriptionEn") or m.get("description_en"),
+        "description_zh": m.get("descriptionZh") or m.get("description_zh"),
+        "credits": m.get("credits"),
+        "tags": m.get("tags", []),
         "object": "model",
         "created": 1720872952,  # 2026-07-13 的时间戳
         "owned_by": m.get("vendor", "codebuddy"),
@@ -784,6 +789,10 @@ async def list_models():
             "object": "model",
             "created": 1720872952,
             "owned_by": m.get("vendor") or "codebuddy",
+            "name": m.get("name") or m.get("id", "unknown"),
+            "display_name": m.get("name") or m.get("id", "unknown"),
+            "credits": m.get("credits"),
+            "tags": m.get("tags", []),
         }
         for m in data
     ]
