@@ -16,6 +16,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# 日志/状态目录：统一放项目根 logs/（应用层 logger 按天滚动）
+LOG_DIR="$SCRIPT_DIR/logs"
+mkdir -p "$LOG_DIR"
+
 # 默认配置
 # HOST 默认 0.0.0.0：允许局域网内其它机器访问（如 192.168.31.100:8787）。
 # 仅本机使用可显式指定：./proxy.sh start -H 127.0.0.1
@@ -32,12 +36,9 @@ else
     PYTHON_BIN="python3"
 fi
 
-# 状态文件
-RUNTIME_DIR="$HOME/.codebuddy-proxy"
-PID_FILE="$RUNTIME_DIR/proxy.pid"
-LOG_FILE="$RUNTIME_DIR/proxy.log"
-
-mkdir -p "$RUNTIME_DIR"
+# 状态/日志文件（均在 logs/ 下）
+PID_FILE="$LOG_DIR/proxy.pid"
+LOG_FILE="$LOG_DIR/proxy.sh.log"
 
 log() { printf '[proxy.sh] %s\n' "$*"; }
 
@@ -89,6 +90,7 @@ cmd_start() {
     nohup $PYTHON_BIN -m codebuddy_proxy \
         --host "$PROXY_HOST" \
         --port "$PROXY_PORT" \
+        --log-file "$LOG_DIR/codebuddy-proxy.jsonl" \
         --static-models \
         $EXTRA_ARGS \
         >>"$LOG_FILE" 2>&1 &
@@ -151,7 +153,8 @@ cmd_status() {
         local host="${actual_host:-$PROXY_HOST}"
         local port="${actual:-$PROXY_PORT}"
         log "running (pid=$pid, $host:$port)"
-        log "log: $LOG_FILE"
+        log "shell log: $LOG_FILE"
+        log "jsonl log: $LOG_DIR/codebuddy-proxy.jsonl"
         return 0
     fi
     log "not running (pid_file=${pid:-none})"

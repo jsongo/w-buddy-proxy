@@ -55,7 +55,7 @@ PROXY_PORT=9000 PROXY_EXTRA_ARGS="--desensitize --optimize-context" ./proxy.sh s
 脚本行为：
 - 自动检测 `.venv/bin/python`（优先使用项目 venv）
 - 用 `nohup ... &` 启动，`start` 命令**立即返回**，不会阻塞终端
-- PID 写到 `~/.codebuddy-proxy/proxy.pid`，日志写到 `~/.codebuddy-proxy/proxy.log`
+- PID 写到 `logs/proxy.pid`，启动输出写到 `logs/proxy.sh.log`；应用日志按天滚动（`logs/proxy.log` 与 `logs/codebuddy-proxy.jsonl`，保留 30 天）
 - 停止用 `kill` 优雅退出；10s 内未退出会 fallback 到 `kill -9`
 
 ## 模型列表
@@ -206,7 +206,7 @@ providers:
 --port PORT               绑定端口（默认 8787）
 --endpoint ENDPOINT       CodeBuddy 后端地址
 --session-file PATH       会话文件（默认 ~/.codebuddy-session.json）
---log-file PATH           JSONL 日志（默认 ~/.codebuddy-proxy/codebuddy-proxy.jsonl）
+--log-file PATH           JSONL 日志（默认 <项目根>/logs/codebuddy-proxy.jsonl，可用 CODEBUDDY_PROXY_LOG_FILE 覆盖）
 --desensitize             启用脱敏（推荐）
 --optimize-context        启用消息压缩（Codex 场景推荐）
 --login                   启动时浏览器登录

@@ -228,6 +228,39 @@ app = FastAPI(title="CodeBuddy Proxy (FastAPI)", version="2.0")
 proxy_state: ProxyState | None = None
 
 
+def _get_state_or_none() -> ProxyState | None:
+    """get_state 的容错版本：未初始化时返回 None（用于日志场景）。"""
+    return proxy_state
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """全局兜底异常日志：任何未捕获异常都记录（便于定位问题），再返回 500。"""
+    try:
+        state = _get_state_or_none()
+        if state is not None:
+            import traceback
+            tb = traceback.format_exc()
+            if state.logger:
+                state.logger.error(
+                    "unhandled_exception: %s %s -> %s\n%s",
+                    request.method, request.url.path, exc, tb,
+                )
+            if state.json_logger:
+                state.write_log(
+                    "unhandled_exception",
+                    method=request.method,
+                    path=request.url.path,
+                    error=str(exc),
+                )
+    except Exception:
+        pass  # 日志失败不影响响应
+    return JSONResponse(
+        status_code=500,
+        content={"error": {"message": f"internal error: {exc}", "type": "internal_error"}},
+    )
+
+
 def get_state() -> ProxyState:
     if proxy_state is None:
         raise HTTPException(status_code=503, detail={"error": {"message": "proxy not initialized", "type": "internal_error"}})
@@ -1724,17 +1757,19 @@ def main():
                         help="会话文件路径")
     parser.add_argument("--mock-dir", type=pathlib.Path,
                         help="只使用指定目录中的真实响应 fixture，不访问 CodeBuddy 后端")
+    # 默认日志目录：项目根下的 logs/（相对 __file__ 定位，部署后路径稳定）
+    _default_log_dir = pathlib.Path(__file__).resolve().parents[2] / "logs"
     default_log_file = pathlib.Path(
         os.getenv(
             "CODEBUDDY_PROXY_LOG_FILE",
-            str(pathlib.Path.home() / ".codebuddy-proxy" / "codebuddy-proxy.jsonl"),
+            str(_default_log_dir / "codebuddy-proxy.jsonl"),
         )
     ).expanduser()
     parser.add_argument(
         "--log-file",
         type=pathlib.Path,
         default=default_log_file,
-        help="记录完整请求/响应的 JSONL 文件（默认 ~/.codebuddy-proxy/codebuddy-proxy.jsonl）",
+        help="记录完整请求/响应的 JSONL 文件（默认 <项目根>/logs/codebuddy-proxy.jsonl，可用 CODEBUDDY_PROXY_LOG_FILE 覆盖）",
     )
     parser.add_argument("--desensitize", action="store_true",
                         help="启用脱敏处理，对 system 消息中的敏感词插入零宽空格（缓解审核误拦）")

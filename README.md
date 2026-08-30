@@ -45,7 +45,7 @@ PROXY_PORT=9000 PROXY_EXTRA_ARGS="--desensitize --optimize-context" ./proxy.sh s
 The script:
 - Detects `.venv/bin/python` automatically (preferring the project venv).
 - Uses `nohup ... &` so `start` returns immediately — terminal is **not** blocked.
-- Writes the PID to `~/.codebuddy-proxy/proxy.pid` and logs to `~/.codebuddy-proxy/proxy.log`.
+- Writes the PID to `logs/proxy.pid` and startup output to `logs/proxy.sh.log`; app logs rotate daily (`logs/proxy.log` + `logs/codebuddy-proxy.jsonl`, 30 days kept).
 - Stops cleanly with `kill`; falls back to `kill -9` after 10s if the process doesn't exit.
 
 ---
@@ -208,7 +208,7 @@ providers:
 --port PORT               bind port (default 8787)
 --endpoint ENDPOINT       CodeBuddy backend address
 --session-file PATH       session file (default ~/.codebuddy-session.json)
---log-file PATH           JSONL log (default ~/.codebuddy-proxy/codebuddy-proxy.jsonl)
+--log-file PATH           JSONL log (default <project>/logs/codebuddy-proxy.jsonl, override via CODEBUDDY_PROXY_LOG_FILE)
 --desensitize             enable desensitization (recommended)
 --optimize-context        enable message compression (recommended for Codex)
 --login                   browser login at startup
