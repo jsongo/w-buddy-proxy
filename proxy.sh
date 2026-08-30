@@ -2,7 +2,7 @@
 # proxy.sh - manage the w-buddy-proxy (codebuddy_proxy) FastAPI server
 #
 # Usage:
-#   ./proxy.sh start    [-p PORT] [-H HOST]     # 后台启动 (默认 127.0.0.1:8787)
+#   ./proxy.sh start    [-p PORT] [-H HOST]     # 后台启动 (默认 0.0.0.0:8787，局域网可访问)
 #   ./proxy.sh stop                              # 停止
 #   ./proxy.sh restart  [-p PORT] [-H HOST]     # 重启
 #   ./proxy.sh status                            # 查看状态
@@ -17,7 +17,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # 默认配置
-PROXY_HOST="${PROXY_HOST:-127.0.0.1}"
+# HOST 默认 0.0.0.0：允许局域网内其它机器访问（如 192.168.31.100:8787）。
+# 仅本机使用可显式指定：./proxy.sh start -H 127.0.0.1
+PROXY_HOST="${PROXY_HOST:-0.0.0.0}"
 PROXY_PORT="${PROXY_PORT:-8787}"
 EXTRA_ARGS="${PROXY_EXTRA_ARGS:---desensitize}"
 
