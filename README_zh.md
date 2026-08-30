@@ -67,23 +67,20 @@ PROXY_PORT=9000 PROXY_EXTRA_ARGS="--desensitize --optimize-context" ./proxy.sh s
 # (注意中间的 `--` 分隔，把参数透传给 codebuddy_proxy)
 ```
 
-静态目录包含 28 个模型，`GET /v1/models` 的 `data[].credits` / `models[].credits` 会返回积分倍率（消费 × 倍率）：
+静态目录当前内置 **12 个模型**，`GET /v1/models` 的 `data[].credits` / `models[].credits` 会返回积分倍率（消费 × 倍率）：
 
 | id | name | credits |
 |---|---|---|
 | `auto` | Auto（快速 / 均衡 / 极致 → 0.21 / 0.65 / 1.20） | 动态 |
+| `default` | Default | x2.20 |
 | `glm-5.3` | GLM-5.3 | x0.79 |
 | `glm-5.3-flash` | GLM-5.3-Flash | x0.06 |
-| `glm-5.2` | GLM-5.2 | x0.79 |
-| `glm-5.1` | GLM-5.1 | x0.79 |
-| `glm-5v-turbo` | GLM-5v-Turbo | x0.71 |
 | `hy3` | Hy3（限时免费） | x0.00 |
-| `hy3-lite` | Hy3-Lite | x0.05 |
 | `hy4-preview` | Hy4 preview | x0.29 |
 | `minimax-m3` | MiniMax-M3 | x0.25 |
-| `kimi-k3` / `kimi-k3-1` | Kimi-K3 | x1.62 |
+| `kimi-k3` | Kimi-K3 | x1.62 |
+| `kimi-k3-1` | Kimi-K3（1M 上下文） | x1.62 |
 | `kimi-k2.7` | Kimi-K2.7-Code | x0.57 |
-| `kimi-k2.6` | Kimi-K2.6 | x0.52 |
 | `deepseek-v4-flash` | Deepseek-V4-Flash | x0.17 |
 | `deepseek-v4-pro` | Deepseek-V4-Pro | x0.51 |
 
@@ -109,7 +106,7 @@ base_url = "http://127.0.0.1:8787/v1"
 wire_api = "responses"
 
 [profiles.codebuddy]
-model = "glm-5.2"
+model = "glm-5.3"
 model_provider = "codebuddy"
 ```
 
@@ -135,14 +132,14 @@ codex --profile codebuddy "your task"
 
 ```json
 {
-  "model": "codebuddy/glm-5.2",
+  "model": "codebuddy/glm-5.3",
   "providers": {
     "codebuddy": {
       "name": "CodeBuddy (via local proxy)",
       "package": "@opencode-ai/ai/providers/openai-compatible",
       "settings": { "baseURL": "http://127.0.0.1:8787/v1", "apiKey": "noop" },
       "models": {
-        "glm-5.2":         { "modelID": "glm-5.2",         "name": "GLM-5.2" },
+        "glm-5.3":         { "modelID": "glm-5.3",         "name": "GLM-5.3" },
         "deepseek-v4-pro": { "modelID": "deepseek-v4-pro", "name": "DeepSeek V4 Pro" },
         "kimi-k2.7":       { "modelID": "kimi-k2.7",       "name": "Kimi K2.7" }
       }
@@ -199,7 +196,7 @@ providers:
 
 - Base URL：`http://127.0.0.1:8787/v1`
 - API Key：留空（或启动时设置的 `--api-key`）
-- Model：`/v1/models` 里的任意 id，如 `glm-5.2`、`deepseek-v4-pro`、`kimi-k2.7`、`auto`
+- Model：`/v1/models` 里的任意 id，如 `glm-5.3`、`deepseek-v4-pro`、`kimi-k2.7`、`auto`
 
 ---
 

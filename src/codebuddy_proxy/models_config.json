@@ -104,18 +104,6 @@
       "vendor": "j"
     },
     {
-      "credits": "x0.05 credits",
-      "id": "hy3-lite",
-      "maxAllowedSize": 128000,
-      "maxInputTokens": 128000,
-      "maxOutputTokens": 32000,
-      "name": "Hy3-Lite",
-      "supportsImages": false,
-      "supportsReasoning": true,
-      "supportsToolCall": true,
-      "vendor": "j"
-    },
-    {
       "credits": "x2.20 credits",
       "id": "default",
       "maxAllowedSize": 56000,
@@ -125,148 +113,6 @@
       "supportsImages": false,
       "supportsToolCall": true,
       "vendor": "v"
-    },
-    {
-      "credits": "x0.71 credits",
-      "descriptionEn": "Native Multimodal Model",
-      "descriptionZh": "原生多模态模型",
-      "id": "glm-5v-turbo",
-      "maxAllowedSize": 200000,
-      "maxInputTokens": 200000,
-      "maxOutputTokens": 64000,
-      "name": "GLM-5v-Turbo",
-      "onlyReasoning": true,
-      "reasoning": {
-        "effort": "medium",
-        "summary": "auto"
-      },
-      "relatedModels": {
-        "lite": "glm-5v-turbo",
-        "reasoning": "glm-5v-turbo"
-      },
-      "supportsImages": true,
-      "supportsReasoning": true,
-      "supportsToolCall": true,
-      "tags": [
-        "craft"
-      ],
-      "temperature": 1,
-      "vendor": "e"
-    },
-    {
-      "credits": "x0.79 credits",
-      "descriptionEn": "1M context, built for long-horizon tasks.",
-      "descriptionZh": "1M 上下文,擅长长程任务",
-      "id": "glm-5.2",
-      "maxAllowedSize": 1000000,
-      "maxInputTokens": 1000000,
-      "maxOutputTokens": 48000,
-      "name": "GLM-5.2",
-      "onlyReasoning": true,
-      "reasoning": {
-        "effort": "medium",
-        "summary": "auto"
-      },
-      "relatedModels": {
-        "lite": "glm-5.2",
-        "reasoning": "glm-5.2"
-      },
-      "supportsImages": true,
-      "supportsReasoning": true,
-      "supportsToolCall": true,
-      "tags": [
-        "craft",
-        "badge:夜间折扣:#1E90FF"
-      ],
-      "temperature": 1,
-      "vendor": "e"
-    },
-    {
-      "credits": "x0.79 credits",
-      "descriptionEn": "Great for daily use",
-      "descriptionZh": "能力均衡,适合日常使用",
-      "id": "glm-5.1",
-      "maxAllowedSize": 200000,
-      "maxInputTokens": 200000,
-      "maxOutputTokens": 48000,
-      "name": "GLM-5.1",
-      "onlyReasoning": true,
-      "reasoning": {
-        "effort": "medium",
-        "summary": "auto"
-      },
-      "relatedModels": {
-        "lite": "glm-5.1",
-        "reasoning": "glm-5.1"
-      },
-      "supportsImages": false,
-      "supportsReasoning": true,
-      "supportsToolCall": true,
-      "temperature": 1,
-      "vendor": "e"
-    },
-    {
-      "credits": "x0.80 credits",
-      "disabledMultimodal": true,
-      "id": "glm-5.0",
-      "maxAllowedSize": 200000,
-      "maxInputTokens": 200000,
-      "maxOutputTokens": 48000,
-      "name": "GLM-5.0",
-      "relatedModels": {
-        "lite": "glm-5.0",
-        "reasoning": "glm-5.0"
-      },
-      "supportsImages": false,
-      "supportsReasoning": true,
-      "supportsToolCall": true,
-      "temperature": 1,
-      "vendor": "e"
-    },
-    {
-      "credits": "x0.23 credits",
-      "disabledMultimodal": true,
-      "id": "glm-4.7",
-      "maxAllowedSize": 200000,
-      "maxInputTokens": 200000,
-      "maxOutputTokens": 48000,
-      "name": "GLM-4.7",
-      "supportsImages": false,
-      "supportsReasoning": true,
-      "supportsToolCall": true,
-      "temperature": 1,
-      "vendor": "f"
-    },
-    {
-      "credits": "x0.23 credits",
-      "disabledMultimodal": true,
-      "id": "glm-4.6",
-      "maxAllowedSize": 168000,
-      "maxInputTokens": 168000,
-      "maxOutputTokens": 32000,
-      "name": "GLM-4.6",
-      "supportsImages": false,
-      "supportsReasoning": true,
-      "supportsToolCall": true,
-      "temperature": 1,
-      "vendor": "f"
-    },
-    {
-      "credits": "x0.11 credits",
-      "id": "glm-4.6v",
-      "maxAllowedSize": 128000,
-      "maxInputTokens": 128000,
-      "maxOutputTokens": 32000,
-      "name": "GLM-4.6V",
-      "reasoning": {
-        "effort": "medium",
-        "summary": "auto"
-      },
-      "supportsImages": true,
-      "supportsReasoning": true,
-      "supportsToolCall": true,
-      "temperature": 1,
-      "vendor": "e"
     },
     {
       "credits": "x0.25 credits",
@@ -292,24 +138,6 @@
       "supportsToolCall": true,
       "temperature": 1,
       "vendor": "f"
-    },
-    {
-      "credits": "x0.18 credits",
-      "id": "minimax-m2.5",
-      "maxAllowedSize": 200000,
-      "maxInputTokens": 200000,
-      "maxOutputTokens": 48000,
-      "name": "MiniMax-M2.5",
-      "onlyReasoning": true,
-      "reasoning": {
-        "effort": "medium",
-        "summary": "auto"
-      },
-      "supportsImages": false,
-      "supportsReasoning": true,
-      "supportsToolCall": true,
-      "temperature": 1,
-      "vendor": "e"
     },
     {
       "credits": "x1.62 credits",
@@ -350,73 +178,6 @@
         "reasoning": "kimi-k2.7"
       },
       "supportsImages": true,
-      "supportsReasoning": true,
-      "supportsToolCall": true,
-      "temperature": 1,
-      "vendor": "f"
-    },
-    {
-      "credits": "x0.52 credits",
-      "descriptionEn": "A multimodal model, good for daily use.",
-      "descriptionZh": "多模态模型,适合日常任务",
-      "id": "kimi-k2.6",
-      "maxAllowedSize": 256000,
-      "maxInputTokens": 256000,
-      "maxOutputTokens": 32000,
-      "name": "Kimi-K2.6",
-      "onlyReasoning": true,
-      "reasoning": {
-        "effort": "medium",
-        "summary": "auto"
-      },
-      "relatedModels": {
-        "lite": "kimi-k2.6",
-        "reasoning": "kimi-k2.6"
-      },
-      "supportsImages": true,
-      "supportsReasoning": true,
-      "supportsToolCall": true,
-      "tags": [
-        "craft"
-      ],
-      "temperature": 1,
-      "vendor": "f"
-    },
-    {
-      "credits": "x0.45 credits",
-      "id": "kimi-k2.5",
-      "maxAllowedSize": 164000,
-      "maxInputTokens": 164000,
-      "maxOutputTokens": 32000,
-      "name": "Kimi-K2.5",
-      "onlyReasoning": true,
-      "reasoning": {
-        "effort": "medium",
-        "summary": "auto"
-      },
-      "relatedModels": {
-        "lite": "kimi-k2.5",
-        "reasoning": "kimi-k2.5"
-      },
-      "supportsImages": true,
-      "supportsReasoning": true,
-      "supportsToolCall": true,
-      "temperature": 1,
-      "vendor": "f"
-    },
-    {
-      "credits": "x0.54 credits",
-      "id": "kimi-k2-thinking",
-      "maxAllowedSize": 164000,
-      "maxInputTokens": 164000,
-      "maxOutputTokens": 32000,
-      "name": "Kimi-K2-Thinking",
-      "onlyReasoning": true,
-      "reasoning": {
-        "effort": "medium",
-        "summary": "auto"
-      },
-      "supportsImages": false,
       "supportsReasoning": true,
       "supportsToolCall": true,
       "temperature": 1,
@@ -469,68 +230,6 @@
       "supportsToolCall": true,
       "temperature": 1,
       "vendor": "f"
-    },
-    {
-      "credits": "x0.29 credits",
-      "disabledMultimodal": true,
-      "id": "deepseek-v3-2-volc",
-      "maxAllowedSize": 96000,
-      "maxInputTokens": 96000,
-      "maxOutputTokens": 32000,
-      "name": "DeepSeek-V3.2",
-      "onlyReasoning": true,
-      "reasoning": {
-        "effort": "medium",
-        "summary": "auto"
-      },
-      "relatedModels": {
-        "lite": "deepseek-v3-2-volc",
-        "reasoning": "deepseek-v3-2-volc"
-      },
-      "supportsImages": false,
-      "supportsReasoning": true,
-      "supportsToolCall": true,
-      "temperature": 1,
-      "vendor": "e"
-    },
-    {
-      "credits": "x0.04 credits",
-      "disabledMultimodal": true,
-      "id": "hunyuan-2.0-thinking",
-      "maxAllowedSize": 128000,
-      "maxInputTokens": 128000,
-      "maxOutputTokens": 24000,
-      "name": "Hunyuan-2.0-Thinking",
-      "onlyReasoning": true,
-      "reasoning": {
-        "effort": "medium",
-        "summary": "auto"
-      },
-      "repetition_penalty": 1.05,
-      "supportsImages": false,
-      "supportsReasoning": true,
-      "supportsToolCall": true,
-      "temperature": 0.7,
-      "top_k": 20,
-      "top_p": 0.8,
-      "vendor": "e"
-    },
-    {
-      "disabledMultimodal": true,
-      "id": "hunyuan-chat",
-      "maxInputTokens": 200000,
-      "maxOutputTokens": 8192,
-      "name": "Hunyuan-Turbos",
-      "supportsImages": false,
-      "supportsTll": true,
-      "vendor": "j"
-    },
-    {
-      "id": "hunyuan-image-v3.0",
-      "name": "Hunyuan Image V3",
-      "tags": [
-        "text-to-image"
-      ]
     }
   ]
 }

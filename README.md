@@ -59,23 +59,20 @@ Both static (`src/codebuddy_proxy/models_config.json`) and remote model lists ar
 # (note the `--` separator so proxy.sh passes it through)
 ```
 
-The static catalog includes 28 models with credits (multiplier × base cost). Sample credits shown by `GET /v1/models` → `data[].credits` / `models[].credits`:
+The static catalog currently ships **12 models** with their credit multiplier (× base cost). `GET /v1/models` → `data[].credits` / `models[].credits` exposes the multiplier:
 
 | id | name | credits |
 |---|---|---|
 | `auto` | Auto (fast / balanced / ultimate → 0.21 / 0.65 / 1.20) | dynamic |
+| `default` | Default | x2.20 |
 | `glm-5.3` | GLM-5.3 | x0.79 |
 | `glm-5.3-flash` | GLM-5.3-Flash | x0.06 |
-| `glm-5.2` | GLM-5.2 | x0.79 |
-| `glm-5.1` | GLM-5.1 | x0.79 |
-| `glm-5v-turbo` | GLM-5v-Turbo | x0.71 |
 | `hy3` | Hy3 (限时免费) | x0.00 |
-| `hy3-lite` | Hy3-Lite | x0.05 |
 | `hy4-preview` | Hy4 preview | x0.29 |
 | `minimax-m3` | MiniMax-M3 | x0.25 |
-| `kimi-k3` / `kimi-k3-1` | Kimi-K3 | x1.62 |
+| `kimi-k3` | Kimi-K3 | x1.62 |
+| `kimi-k3-1` | Kimi-K3 (1M context) | x1.62 |
 | `kimi-k2.7` | Kimi-K2.7-Code | x0.57 |
-| `kimi-k2.6` | Kimi-K2.6 | x0.52 |
 | `deepseek-v4-flash` | Deepseek-V4-Flash | x0.17 |
 | `deepseek-v4-pro` | Deepseek-V4-Pro | x0.51 |
 
@@ -111,7 +108,7 @@ base_url = "http://127.0.0.1:8787/v1"
 wire_api = "responses"
 
 [profiles.codebuddy]
-model = "glm-5.2"
+model = "glm-5.3"
 model_provider = "codebuddy"
 ```
 
@@ -137,14 +134,14 @@ codex --profile codebuddy "your task"
 
 ```json
 {
-  "model": "codebuddy/glm-5.2",
+  "model": "codebuddy/glm-5.3",
   "providers": {
     "codebuddy": {
       "name": "CodeBuddy (via local proxy)",
       "package": "@opencode-ai/ai/providers/openai-compatible",
       "settings": { "baseURL": "http://127.0.0.1:8787/v1", "apiKey": "noop" },
       "models": {
-        "glm-5.2":         { "modelID": "glm-5.2",         "name": "GLM-5.2" },
+        "glm-5.3":         { "modelID": "glm-5.3",         "name": "GLM-5.3" },
         "deepseek-v4-pro": { "modelID": "deepseek-v4-pro", "name": "DeepSeek V4 Pro" },
         "kimi-k2.7":       { "modelID": "kimi-k2.7",       "name": "Kimi K2.7" }
       }
@@ -201,7 +198,7 @@ providers:
 
 - Base URL: `http://127.0.0.1:8787/v1`
 - API Key: blank (or your `--api-key`)
-- Model: any id from `/v1/models`, e.g. `glm-5.2`, `deepseek-v4-pro`, `kimi-k2.7`, `auto`
+- Model: any id from `/v1/models`, e.g. `glm-5.3`, `deepseek-v4-pro`, `kimi-k2.7`, `auto`
 
 ---
 
