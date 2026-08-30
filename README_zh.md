@@ -67,7 +67,7 @@ PROXY_PORT=9000 PROXY_EXTRA_ARGS="--desensitize --optimize-context" ./proxy.sh s
 # (注意中间的 `--` 分隔，把参数透传给 codebuddy_proxy)
 ```
 
-静态目录当前内置 **12 个模型**，`GET /v1/models` 的 `data[].credits` / `models[].credits` 会返回积分倍率（消费 × 倍率）：
+静态目录当前内置 **11 个模型**，`GET /v1/models` 的 `data[].credits` / `models[].credits` 会返回积分倍率（消费 × 倍率）：
 
 | id | name | credits |
 |---|---|---|
@@ -79,7 +79,6 @@ PROXY_PORT=9000 PROXY_EXTRA_ARGS="--desensitize --optimize-context" ./proxy.sh s
 | `hy4-preview` | Hy4 preview | x0.29 |
 | `minimax-m3` | MiniMax-M3 | x0.25 |
 | `kimi-k3` | Kimi-K3 | x1.62 |
-| `kimi-k3-1` | Kimi-K3（1M 上下文） | x1.62 |
 | `kimi-k2.7` | Kimi-K2.7-Code | x0.57 |
 | `deepseek-v4-flash` | Deepseek-V4-Flash | x0.17 |
 | `deepseek-v4-pro` | Deepseek-V4-Pro | x0.51 |

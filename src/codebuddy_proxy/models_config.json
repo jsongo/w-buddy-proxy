@@ -140,26 +140,6 @@
       "vendor": "f"
     },
     {
-      "credits": "x1.62 credits",
-      "descriptionEn": "Excels at complex, long-horizon autonomous tasks, with standout front-end skills and strong knowledge work and scientific reasoning",
-      "descriptionZh": "擅长处理复杂的长程自主任务,前端开发能力突出,同时在知识工作与科研推理上表现出色。",
-      "id": "kimi-k3-1",
-      "maxAllowedSize": 1000000,
-      "maxInputTokens": 1000000,
-      "maxOutputTokens": 32000,
-      "name": "Kimi-K3",
-      "onlyReasoning": true,
-      "reasoning": {
-        "effort": "medium",
-        "summary": "auto"
-      },
-      "supportsImages": true,
-      "supportsReasoning": true,
-      "supportsToolCall": true,
-      "temperature": 1,
-      "vendor": "f"
-    },
-    {
       "credits": "x0.57 credits",
       "descriptionEn": "A multimodal model, good for daily use.",
       "descriptionZh": "多模态模型,适合日常任务",

@@ -59,7 +59,7 @@ Both static (`src/codebuddy_proxy/models_config.json`) and remote model lists ar
 # (note the `--` separator so proxy.sh passes it through)
 ```
 
-The static catalog currently ships **12 models** with their credit multiplier (× base cost). `GET /v1/models` → `data[].credits` / `models[].credits` exposes the multiplier:
+The static catalog currently ships **11 models** with their credit multiplier (× base cost). `GET /v1/models` → `data[].credits` / `models[].credits` exposes the multiplier:
 
 | id | name | credits |
 |---|---|---|
@@ -71,7 +71,6 @@ The static catalog currently ships **12 models** with their credit multiplier (�
 | `hy4-preview` | Hy4 preview | x0.29 |
 | `minimax-m3` | MiniMax-M3 | x0.25 |
 | `kimi-k3` | Kimi-K3 | x1.62 |
-| `kimi-k3-1` | Kimi-K3 (1M context) | x1.62 |
 | `kimi-k2.7` | Kimi-K2.7-Code | x0.57 |
 | `deepseek-v4-flash` | Deepseek-V4-Flash | x0.17 |
 | `deepseek-v4-pro` | Deepseek-V4-Pro | x0.51 |
