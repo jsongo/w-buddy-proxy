@@ -779,8 +779,18 @@ async def list_models():
     
     # 转换为 Codex 格式
     codex_models = [model_to_codex_format(m) for m in data]
-    
-    return {"models": codex_models}
+
+    # 同时返回标准 OpenAI 格式（data）与 Codex 格式（models），客户端任选解析
+    openai_models = [
+        {
+            "id": m.get("id", "unknown"),
+            "object": "model",
+            "created": 1720872952,
+            "owned_by": "codebuddy",
+        }
+        for m in data
+    ]
+    return {"object": "list", "data": openai_models, "models": codex_models}
 
 
 # ============================================================================
