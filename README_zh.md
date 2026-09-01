@@ -16,6 +16,7 @@
 - **DSML 解析** — 自动识别并转换 DeepSeek Markup Language 工具调用
 - **流式输出** — SSE 实时返回，带空闲 / 总时长双重超时保护
 - **多账号** — 隔离的 session 文件，方便工作 / 个人账号切换
+- **多 Provider** — 除 CodeBuddy 外，内置豆包（纯 stdlib CDP 直连豆包工作 App），统一经 `/v1/models` 列出、按模型名路由
 
 ---
 
@@ -35,6 +36,22 @@ uv run python -m codebuddy_proxy --login --desensitize
 ```
 
 默认监听 `http://127.0.0.1:8787`。
+
+### 豆包 Provider（可选）
+
+除 CodeBuddy 外，内置豆包 provider（纯 stdlib CDP 直连本地「豆包工作」App，零额外依赖）：
+
+```bash
+# 启用豆包 provider（需要本机已安装并登录豆包工作 App）
+uv run python -m codebuddy_proxy --desensitize --doubao
+```
+
+- **原理**：复用豆包工作 App 的登录态与内置 Chromium（CDP 直连），在页面 JS 环境 fetch
+  自动注入 a_bogus 风控签名，无需扫码、无需额外凭证
+- **模型**：`doubao`（快速）、`doubao-pro`、`doubao-think`（深度思考）、`doubao-expert`（专家）
+- **依赖**：纯 Python 标准库，不需要 Playwright / chromium
+- **CDP 模式**：默认优先复用主 App（`open -a DoubaoWork --args --remote-debugging-port=9223`，
+  不杀用户进程）；主 App 不可用时回退独立 Helper
 
 ### 用 `proxy.sh` 后台管理（推荐）
 
