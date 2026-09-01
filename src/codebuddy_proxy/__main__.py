@@ -84,6 +84,8 @@ def main():
                         help="远程配置缓存 TTL（秒，默认 300）")
     parser.add_argument("--doubao", action="store_true", default=os.getenv("DOUBAO_ENABLED", "") == "1",
                         help="启用豆包 provider（自研内联，直连豆包工作 App CDP）")
+    parser.add_argument("--trae", action="store_true", default=os.getenv("TRAE_ENABLED", "") == "1",
+                        help="启用 Trae provider（解密 Trae IDE 登录态，直连底层模型）")
     args = parser.parse_args()
     args.log_file = args.log_file.expanduser()
 
@@ -99,19 +101,25 @@ def main():
     if args.login:
         client.login(open_browser=not args.no_browser)
 
-    # 初始化额外 provider（豆包等）
+    # 初始化额外 provider（豆包/Trae 等）
     providers: dict[str, BaseProvider] = {}
     if args.doubao:
-        doubao = DoubaoProvider(
-            headless=args.doubao_headless,
-            user_data_dir=args.doubao_user_data_dir or None,
-            backend=args.doubao_backend,
-        )
+        doubao = DoubaoProvider()
         providers[doubao.id] = doubao
-        logger.info("Doubao provider enabled (backend=%s)", args.doubao_backend)
-        print(f"[Doubao] Enabled (backend={args.doubao_backend})")
+        logger.info("Doubao provider enabled (CDP)")
+        print("[Doubao] Enabled (CDP)")
     else:
         print("[Doubao] Disabled (pass --doubao or DOUBAO_ENABLED=1 to enable)")
+
+    if args.trae:
+        from codebuddy_proxy.trae_provider import TraeProvider
+
+        trae = TraeProvider()
+        providers[trae.id] = trae
+        logger.info("Trae provider enabled")
+        print("[Trae] Enabled")
+    else:
+        print("[Trae] Disabled (pass --trae or TRAE_ENABLED=1 to enable)")
 
     # 创建全局状态
     _state.proxy_state = ProxyState(
