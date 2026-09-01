@@ -27,6 +27,12 @@ class BaseProvider(abc.ABC):
     """上游模型源的统一抽象。"""
 
     #: provider 唯一标识（用于日志、路由、模型归属）。
+    #:
+    #: 命名约定：只允许小写字母、数字和连字符 ``-``（形如 ``doubao``、
+    #: ``doubao-pro``、``codebuddy``）。**禁止使用斜杠 ``/``**——因为 provider
+    #: id 会作为 ``owned_by`` 暴露在 ``/v1/models`` 中，且可能被上层配置
+    #: （如 ethan-ai 的 ``provider:`` 字段）直接引用，斜杠会与「provider/模型」
+    #: 的层级分隔符产生歧义。
     id: str = "base"
     #: 人类可读名称。
     name: str = "Base Provider"
