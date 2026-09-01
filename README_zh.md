@@ -263,6 +263,48 @@ providers:
 
 端点使用本地 session 认证，无需额外 token。
 
+---
+
+## Provider 接口一览
+
+三种 provider 统一注册到 `providers.py` 的抽象层，`forward_chat` 按模型名路由。
+
+### 1. CodeBuddy Provider（`codebuddy_provider.py`）
+
+| 接口 | 说明 |
+| --- | --- |
+| `GET /v1/models` | 模型列表（静态 `models_config.json` / 本地配置 / 远程动态） |
+| `POST /v1/chat/completions` | OpenAI 对话（`stream_upstream` 流式 / `collect_upstream` 非流式） |
+| `POST /v1/responses` | Codex CLI Responses 协议适配 |
+| `POST /v1/messages` | Claude Code Anthropic Messages 协议适配 |
+| `forward_chat(body, "openai"/"codex"/"anthropic")` | 按协议转换 + 按模型路由到对应 provider |
+| session / 多账号 | 隔离的 session 文件，`--session-file` 指定 |
+
+### 2. 豆包 Provider（`doubao_provider.py` + `doubao/cdp_client.py`）
+
+| 接口 | 说明 |
+| --- | --- |
+| `CDPDoubaoClient.start()` | 确保 CDP：优先复用主 App（`open -a DoubaoWork --args --remote-debugging-port=9223`，不杀进程），兜底独立 Helper |
+| `CDPDoubaoClient.chat_completion()` | 页面内 fetch `/chat/completion`（自动带 a_bogus 签名），流式 yield SSE |
+| `DoubaoProvider.forward()` | 流式 / 非流式转换，返回 OpenAI 标准格式 |
+| 模型 | `doubao`（快速）/ `doubao-pro` / `doubao-think`（深度思考）/ `doubao-expert`（专家） |
+| 依赖 | 纯 Python 标准库，无 Playwright / chromium |
+
+### 3. Trae Provider（`trae_provider.py` + `trae_work_login*.py`）
+
+| 类别 | 接口 | 说明 |
+| --- | --- | --- |
+| 认证 | `decrypt_auth_data()` / `find_auth_data()` | 解密 Trae IDE 本地 `storage.json`（AES-128-CBC + SHA-512 派生） |
+| 认证 | `trae_work_login.py` / `trae_work_login_server.py` | Work 登录（ExchangeToken 换 token，回调自动捕获，落盘 `~/.ethan/trae_work.json`） |
+| 认证 | `_auth()` / `_load_work_cred()` | 凭证加载：`.env` → Work 凭证 → 本地解密 |
+| Chat | `send_trae_chat()` | IDE 通道（3 级端点回退） |
+| Chat | `_send_trae_work_chat()` | **Work 通道**（`function=solo_work_lite` + `config_name`，已验证返回真实回复） |
+| 签到 | `fetch_checkin_status()` | 查询签到/积分状态（`/trae/api/v2/ug/checkin_credits/status`） |
+| 签到 | `claim_checkin_credits()` | 领取签到积分（`/trae/api/v2/ug/checkin_credits/claim`） |
+| 权益 | `ide_user_ent_usage` 端点 | 查询积分总额 / 已用量 / 权益包 |
+| 模型 | `_map_model()` | T1-T5 分级 + 外部名别名（`claude-sonnet-4-5` → `glm-5.2`） |
+| 错误 | `_trae_error_text()` | 14+ 个官方错误码 → 中文文案（4011 今日额度 / 1005 plan 权益不足等） |
+
 ## 免责声明
 
 本项目仅供学习与研究使用，请遵守 CodeBuddy 的服务条款，使用风险自负。

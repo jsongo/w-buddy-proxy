@@ -62,9 +62,10 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSON
                 )
     except Exception:
         pass  # 日志失败不影响响应
+    # 不回显 exc 原文（避免内部细节/路径信息暴露给客户端），详情在服务端日志里
     return JSONResponse(
         status_code=500,
-        content={"error": {"message": f"internal error: {exc}", "type": "internal_error"}},
+        content={"error": {"message": "internal error", "type": "internal_error"}},
     )
 
 

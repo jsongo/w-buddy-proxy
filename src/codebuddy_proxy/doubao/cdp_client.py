@@ -3,18 +3,23 @@
 与 ``BrowserClient``（Playwright，自己开 Chromium 连 doubao.com）不同，
 本客户端**复用豆包工作 App 自带的 Helper（Chromium 147）**：
 
-1. 独立启动 Helper（``--saman-from-chat=1 --remote-debugging-port=<port>``），
-   从磁盘 profile 自动加载完整登录态，无需扫码、无需主 App。
-2. 纯 stdlib WebSocket 直连 CDP（避开 playwright 在沙箱被 SIGTERM 的问题）。
-3. 在 ``chrome://doubaowork-chat/chat`` 页面的 JS 环境里 ``fetch``
+1. 优先**复用主 App**：探测 ``--remote-debugging-port`` 已开则直接连接；
+   未开时用 ``open -a DoubaoWork --args --remote-debugging-port=<port>``
+   拉起主 App（不杀用户进程，主 App 自带 ``--saman-from-chat=<主AppPID>``
+   开 CDP），用户界面正常可用。
+2. 主 App 不可用时才退回**独立 Helper**（``--saman-from-chat=1``），
+   从磁盘 profile 自动加载完整登录态，无需扫码。
+3. 纯 stdlib WebSocket 直连 CDP（避开 playwright 在沙箱被 SIGTERM 的问题）。
+4. 在 ``chrome://doubaowork-chat/chat`` 页面的 JS 环境里 ``fetch``
    ``/chat/completion``，自动带 httpOnly cookie + a_bogus 签名。
-4. 流式：JS 逐块读 SSE 并通过 ``console.log`` 回传，Python 监听
-   ``Runtime.consoleAPICalled`` 事件实时取回。
+5. 流式：JS 后台 fetch 逐块读 SSE push 到 window 队列，Python 轮询取回
+   （该 Helper 不派发 ``Runtime.consoleAPICalled`` 事件，不能走 console 桥）。
 
 关键坑（踩坑总结）：
 - 独立 Helper 必须加 ``--disable-features=SpareRendererForSitePerProcess``，
   否则 10 秒后 spare renderer 崩溃连锁拖垮 network service。
-- 启动前必须 ``pkill -KILL -f DoubaoWork``，否则单例锁拦截伪 pid 启动。
+- 只在**退回独立 Helper** 时才 ``pkill -KILL -f DoubaoWork``（单例锁拦截
+  伪 pid 启动）；复用主 App 时绝不杀进程。
 - CDP 客户端帧必须 masked（RFC6455 规定）。
 
 接口与 ``BrowserClient`` 对齐，供 ``DoubaoProvider`` 无缝切换。
@@ -191,34 +196,63 @@ class CDPDoubaoClient:
     # 生命周期
     # ------------------------------------------------------------------
 
+    def _probe_cdp(self) -> bool:
+        """探测端口上是否已有可用的 CDP（主 App 已开调试端口）。"""
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{self.port}/json/version", timeout=2
+            ) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
+    async def _connect_chat(self) -> None:
+        """连接 chat 页面 target，等 bdms 就绪并提取 web_id。"""
+        chat = await self._wait_for_target()
+        if not chat:
+            raise RuntimeError("CDP target not found")
+        ws_url = chat["webSocketDebuggerUrl"]
+        path = ws_url.split(f":{self.port}", 1)[1]
+        self._ws = _WS("127.0.0.1", self.port, path)
+        await self._wait_for_bdms()
+        self._web_id = await self._extract_web_id() or ""
+        self._ready = True
+        log.info("CDPDoubaoClient: ready (web_id=%s)", self._web_id[:20])
+
     async def start(self) -> None:
-        """启动独立 Helper 并连上 CDP。"""
-        # 1. 清理残留（否则单例锁拦截）
+        """确保 CDP 可用：优先复用主 App（共存，不杀用户进程），兜底独立 Helper。"""
+        # 1) 端口已有 CDP 直接复用（主 App 正在跑且开了调试端口）
+        if self._probe_cdp():
+            log.info("CDPDoubaoClient: reuse existing CDP on port %d", self.port)
+            await self._connect_chat()
+            return
+
+        # 2) 尝试拉起主 App（不杀进程；主 App 自带 saman-from-chat 开 CDP）
+        try:
+            subprocess.run(
+                ["open", "-a", "DoubaoWork", "--args", f"--remote-debugging-port={self.port}"],
+                capture_output=True,
+                timeout=10,
+            )
+            for _ in range(30):
+                await asyncio.sleep(1)
+                if self._probe_cdp():
+                    log.info("CDPDoubaoClient: 主 App CDP ready on port %d", self.port)
+                    await self._connect_chat()
+                    return
+            log.warning("CDPDoubaoClient: 主 App 未开 CDP，回退独立 Helper")
+        except Exception as e:
+            log.warning("CDPDoubaoClient: 主 App 拉起异常（%s），回退独立 Helper", e)
+
+        # 3) 兜底：独立 Helper（此时才清理残留进程，否则单例锁拦截）
         subprocess.run(["pkill", "-KILL", "-f", "DoubaoWork"], check=False)
         await asyncio.sleep(2)
-
-        # 2. 启动 Helper
         cmd = [self.helper_bin, f"--remote-debugging-port={self.port}", *_STABLE_FLAGS]
         self._proc = subprocess.Popen(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
         log.info("CDPDoubaoClient: Helper started pid=%s port=%d", self._proc.pid, self.port)
-
-        # 3. 等 CDP target 就绪
-        chat = await self._wait_for_target()
-        if not chat:
-            raise RuntimeError("CDP target not found")
-
-        # 4. 连接 WS
-        ws_url = chat["webSocketDebuggerUrl"]
-        path = ws_url.split(f":{self.port}", 1)[1]
-        self._ws = _WS("127.0.0.1", self.port, path)
-
-        # 5. 等 bdms 就绪 + 提取 web_id
-        await self._wait_for_bdms()
-        self._web_id = await self._extract_web_id() or ""
-        self._ready = True
-        log.info("CDPDoubaoClient: ready (web_id=%s)", self._web_id[:20])
+        await self._connect_chat()
 
     async def stop(self) -> None:
         if self._ws:

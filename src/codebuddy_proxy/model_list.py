@@ -342,7 +342,7 @@ def model_to_codex_format(m: dict[str, Any]) -> dict[str, Any]:
         "credits": m.get("credits"),
         "tags": m.get("tags", []),
         "object": "model",
-        "created": 1720872952,  # 2026-07-13 的时间戳
+        "created": 1720872952,  # 2024-07-13 的时间戳（Unix epoch）
         "owned_by": m.get("vendor", "codebuddy"),
 
         # Reasoning 支持

@@ -58,7 +58,12 @@ def _extract_prompt(messages: list[dict[str, Any]]) -> str:
         else:
             text = ""
         if text:
-            parts.append(text if len(messages) == 1 else f"[{role}]: {text}")
+            # user 消息保持自然语言（不带前缀）；非 user（system 等）必须带
+            # role 前缀，否则单条 system 消息会被当成用户正文发给豆包
+            if role == "user":
+                parts.append(text)
+            else:
+                parts.append(f"[{role}]: {text}")
     return "\n".join(parts)
 
 
@@ -294,7 +299,10 @@ class DoubaoProvider(BaseProvider):
 
         except Exception as exc:
             log.error("doubao stream error: %s", exc)
+            self._client.record_failure(0)
             yield f"data: {json.dumps(_chunk({'content': f'[Error: {exc}]'}), ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
 
         self._client.record_success()
 
