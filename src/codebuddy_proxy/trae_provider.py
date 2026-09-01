@@ -386,6 +386,35 @@ def _auth() -> tuple[str, str]:
 
 # ───────────────────────── SSE 解析 ─────────────────────────
 
+# Trae 错误码 -> 友好中文文案（官方 docs.trae.ai/ide/error-codes）
+_TRAE_ERROR_HINTS: dict[int, str] = {
+    3003: "Trae 模型暂不可用（今日额度可能已用完，或当前模型无权限）",
+    3004: "Trae 当前模型访问量过大，请稍后重试",
+    4001: "Trae 服务端错误，请稍后重试",
+    4007: "Trae 请求限流，请稍后重试",
+    4010: "Trae 检测到风险账号，已自动登出，请重新登录",
+    4011: "Trae AI 问答今日用量已达上限，请明日再试",
+    4013: "Trae AI 服务在当前地区不可用",
+    4015: "Trae 检测到账号/IP 风险，请求已被阻止",
+    4021: "Trae 今日会话次数已达上限，请明日再试",
+    4022: "Trae 请求失败，请尝试新建会话并重试",
+    4023: "Trae 模型列表已更新，请确认后重试",
+    4050: "Trae 请求超时，模型服务资源紧张，请稍后重试",
+    4051: "Trae 请求超时，模型服务资源紧张，请稍后重试",
+}
+
+
+def _trae_error_text(data: dict[str, Any]) -> str:
+    """把 Trae 错误事件转成友好中文文案。"""
+    code = data.get("code")
+    msg = data.get("message") or data.get("error") or ""
+    if isinstance(code, int) and code in _TRAE_ERROR_HINTS:
+        hint = _TRAE_ERROR_HINTS[code]
+        return f"{hint}" + (f"（{msg}）" if msg and msg not in hint else "")
+    if msg:
+        return f"Trae 错误: {msg}"
+    return "Trae 未知错误"
+
 def _parse_sse(text: str) -> list[tuple[str, dict[str, Any]]]:
     """解析 Trae SSE 流 -> [(event, data_dict), ...]。"""
     events = []
@@ -500,8 +529,8 @@ class TraeProvider(BaseProvider):
             raw = send_trae_chat(messages, model, stream=True, base_url=self._base_url)
             for event, data in _parse_sse(raw):
                 if event == "error":
-                    msg = data.get("message") or data.get("error") or ""
-                    yield chunk({"content": f"[Trae Error: {msg}]"})
+                    msg = _trae_error_text(data)
+                    yield chunk({"content": f"[{msg}]"})
                     yield "data: [DONE]\n\n"
                     return
                 if event == "output":
@@ -534,7 +563,7 @@ class TraeProvider(BaseProvider):
             if event == "error":
                 raise HTTPException(
                     status_code=502,
-                    detail=f"trae upstream error: {data.get('message') or data.get('error')}",
+                    detail=_trae_error_text(data),
                 )
             if event == "output":
                 if data.get("reasoning_content"):

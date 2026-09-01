@@ -53,6 +53,23 @@ uv run python -m codebuddy_proxy --desensitize --doubao
 - **CDP 模式**：默认优先复用主 App（`open -a DoubaoWork --args --remote-debugging-port=9223`，
   不杀用户进程）；主 App 不可用时回退独立 Helper
 
+### Trae Provider（可选）
+
+除 CodeBuddy 和豆包外，内置 Trae provider（解密 Trae IDE 登录态，直连底层模型）：
+
+```bash
+# 启用 Trae provider（需要本机已安装并登录 Trae IDE）
+uv run python -m codebuddy_proxy --desensitize --trae
+```
+
+- **原理**：自动解密 Trae IDE 本地存储的 tc 加密登录态（AES-128-CBC + SHA-512），
+  或从 `.env` 读 `TRAE_TOKEN` / `TRAE_USER_ID`，直连 `trae-api-cn.mchost.guru`
+- **模型**：T1-T5 分级（glm-5.2 / qwen-3.7-plus / kimi-k2.6 / DeepSeek-V4-Pro 等），
+  支持外部名别名（如 `claude-sonnet-4-5` → `glm-5.2`）
+- **依赖**：纯 Python 标准库（含零依赖 AES 兜底实现），不需要 Node.js
+- **注意**：免费账号有日/周调用额度，耗尽时报 `4011`（今日用量已达上限），
+  错误会以友好中文文案透传
+
 ### 用 `proxy.sh` 后台管理（推荐）
 
 常驻后台运行时不用阻塞终端：
