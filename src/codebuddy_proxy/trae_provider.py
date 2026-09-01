@@ -45,6 +45,10 @@ IDE_VERSION = "3.3.67"
 IDE_VERSION_CODE = "20260401"
 X_APP_ID = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
 
+# Trae Work (SOLO) 客户端版本（traework2api 实测值，Work 与 IDE 版本不同）
+_TRAE_APP_VERSION = "0.1.43"
+_TRAE_APP_VERSION_CODE = "20260716"
+
 # 3 级端点回退（与 trae-local-api 一致）
 ENDPOINTS = [
     "/api/agent/v3/llm_utils_chat",
@@ -244,25 +248,120 @@ def _extract_auth_fields(data: dict[str, Any]) -> tuple[str, str]:
     return str(token), str(user_id)
 
 
+# ───────────────────────── 签到 / 积分 ─────────────────────────
+
+_UG_API_HOST = "https://api.trae.cn"
+# 签到 API 是 device 维度的：device_id 从 JWT 里的稳定 userId 派生（trae2api-cn 方案）
+_CHECKIN_DEVICE_IDS: dict[str, str] = {}
+
+
+def _checkin_identity(token: str, account_id: str = "") -> str:
+    """从 JWT 提取稳定 identity（不依赖可能刷新的 token 本身）。"""
+    if token:
+        try:
+            parts = token.split(".")
+            if len(parts) >= 2:
+                import base64 as _b64
+
+                encoded = parts[1] + "=" * (-len(parts[1]) % 4)
+                payload = json.loads(_b64.urlsafe_b64decode(encoded.encode("ascii")))
+                data = payload.get("data")
+                if isinstance(data, dict) and data.get("id"):
+                    return str(data["id"])
+                for key in ("user_id", "userId", "sub"):
+                    if payload.get(key):
+                        return str(payload[key])
+        except Exception:
+            pass
+    if account_id:
+        return str(account_id)
+    return token
+
+
+def checkin_device_id(token: str, account_id: str = "") -> str:
+    """返回账号绑定的 16 位稳定 device id（签到 API 需要）。"""
+    identity = _checkin_identity(token, account_id)
+    if not identity:
+        return ""
+    cache_key = f"checkin#{identity}"
+    if cache_key in _CHECKIN_DEVICE_IDS:
+        return _CHECKIN_DEVICE_IDS[cache_key]
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    did = str(int(digest, 16) % 10**16).zfill(16)
+    _CHECKIN_DEVICE_IDS[cache_key] = did
+    return did
+
+
+def _build_checkin_headers(token: str, account_id: str = "") -> dict[str, str]:
+    headers = {
+        "Authorization": f"Cloud-IDE-JWT {token}",
+        "Content-Type": "application/json",
+        "x-device-id": checkin_device_id(token, account_id),
+        "x-device-brand": "ASUS TUF Gaming A15 FA507RM_FA507RM",
+        "x-device-type": "windows",
+    }
+    return headers
+
+
+def _post_ug(path: str, token: str = "", account_id: str = "") -> dict[str, Any]:
+    """调用 Trae UG（user growth）签到/积分 API。"""
+    if not token:
+        token, _ = _auth()
+    url = _UG_API_HOST + path
+    req = urllib.request.Request(
+        url,
+        data=b"{}",
+        headers=_build_checkin_headers(token, account_id),
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Trae UG {path} [{e.code}]: {e.read().decode()[:300]}")
+    return data
+
+
+def fetch_checkin_status(token: str = "", account_id: str = "") -> dict[str, Any]:
+    """查询今日签到/积分状态。"""
+    return _post_ug("/trae/api/v2/ug/checkin_credits/status", token, account_id)
+
+
+def claim_checkin_credits(token: str = "", account_id: str = "") -> dict[str, Any]:
+    """领取今日签到积分。"""
+    return _post_ug("/trae/api/v2/ug/checkin_credits/claim", token, account_id)
+
+
 # ───────────────────────── Trae API 调用 ─────────────────────────
 
 def _build_headers(token: str, user_id: str) -> dict[str, str]:
+    """构建 SOLO 完整请求头（traework2api headers.go 实测值）。
+
+    关键：必须带 User-Agent: Trae/<ver> + X-Ide-Token 等 SOLO 专属头，
+    缺 UA 会被服务端当异常客户端限流（4011）。
+    """
     machine_id = uuid.uuid4().hex
     device_id = hashlib.sha256(machine_id.encode()).hexdigest()[:32]
     return {
-        "Authorization": f"Cloud-IDE-JWT {token}",
-        "X-Cloudide-Token": token,
-        "x-uid": user_id or "",
-        "x-app-id": X_APP_ID,
-        "x-device-id": device_id,
-        "x-machine-id": machine_id,
-        "x-request-id": str(uuid.uuid4()),
-        "x-ide-version": IDE_VERSION,
-        "x-ide-version-code": IDE_VERSION_CODE,
-        "x-device-type": "windows",
-        "x-os-version": "Windows 10",
         "Content-Type": "application/json",
         "Accept": "text/event-stream",
+        "User-Agent": f"Trae/{_TRAE_APP_VERSION}",
+        "Authorization": f"Cloud-IDE-JWT {token}",
+        "X-Cloudide-Token": token,
+        "X-Ide-Token": token,
+        "X-Uid": user_id or "",
+        "X-App-Id": X_APP_ID,
+        "X-App-Version": "default",
+        "X-Ide-Version": _TRAE_APP_VERSION,
+        "X-Ide-Version-Code": _TRAE_APP_VERSION_CODE,
+        "X-App-Version-Code": _TRAE_APP_VERSION_CODE,
+        "X-Ide-Version-Type": "stable",
+        "X-Device-Type": "windows",
+        "X-OS-Version": "Windows 11 Pro",
+        "X-Device-Brand": "83DG",
+        "Request-Traffic-Type": "prod",
+        "X-Machine-Id": machine_id,
+        "X-Device-Id": device_id,
     }
 
 
@@ -294,6 +393,7 @@ def _build_chat_body(messages: list[dict[str, Any]], model: str, stream: bool) -
     return {
         "messages": messages,
         "model": model,
+        "config_name": model,  # Work 通道必须 config_name + model 成对（traework2api 实测）
         "function": "inline_chat",
         "stream": stream,
         "request_id": session_id,
@@ -310,7 +410,13 @@ def send_trae_chat(
     """直连 Trae API，返回原始 SSE 文本。
 
     3 级端点回退。认证失败抛 HTTPException(401)，其余抛 RuntimeError。
+    若使用 Work 凭证（~/.ethan/trae_work.json），自动走 Work 通道
+    （function=solo_work_lite + api.trae.com.cn）。
     """
+    work = _load_work_cred()
+    if work and work.get("access_token"):
+        return _send_trae_work_chat(messages, model, stream, work)
+
     token, user_id = _auth()
     trae_model = _map_model(model)
     body = _build_chat_body(messages, trae_model, stream)
@@ -342,14 +448,94 @@ def send_trae_chat(
     raise HTTPException(status_code=502, detail=f"trae all endpoints failed: {last_error}")
 
 
+def _send_trae_work_chat(
+    messages: list[dict[str, Any]],
+    model: str,
+    stream: bool,
+    work: dict[str, Any],
+) -> str:
+    """Trae Work 通道：function=solo_work_lite + 完整 SOLO headers。
+
+    参考 traework2api（Go）的 Work 通道实现：
+    - headers 必须带 User-Agent: Trae/<ver> + X-Ide-Token 等 SOLO 专属头
+      （缺 UA 会被服务端当异常客户端限流 4011）
+    - host 用 mchost.guru（AgentHost），签到/积分才用 api.trae.cn
+    """
+    token = work["access_token"]
+    uid = work.get("uid") or ""
+
+    trae_model = _map_model(model)
+    body = _build_chat_body(messages, trae_model, stream)
+    body["function"] = "solo_work_lite"
+
+    machine_id = work.get("machine_id") or uuid.uuid4().hex
+    device_id = work.get("device_id") or hashlib.sha256(machine_id.encode()).hexdigest()[:32]
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream" if stream else "application/json",
+        "User-Agent": f"Trae/{_TRAE_APP_VERSION}",
+        "Authorization": f"Cloud-IDE-JWT {token}",
+        "X-Cloudide-Token": token,
+        "X-Ide-Token": token,
+        "X-Uid": uid,
+        "X-App-Id": X_APP_ID,
+        "X-App-Version": "default",
+        "X-Ide-Version": _TRAE_APP_VERSION,
+        "X-Ide-Version-Code": _TRAE_APP_VERSION_CODE,
+        "X-App-Version-Code": _TRAE_APP_VERSION_CODE,
+        "X-Ide-Version-Type": "stable",
+        "X-Device-Type": "windows",
+        "X-OS-Version": "Windows 11 Pro",
+        "X-Device-Brand": "83DG",
+        "Request-Traffic-Type": "prod",
+        "X-Machine-Id": machine_id,
+        "X-Device-Id": device_id,
+    }
+
+    url = f"{BASE_URL_CN}/api/agent/v3/llm_utils_chat"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")[:500]
+        raise HTTPException(status_code=502, detail=f"trae work chat failed: {e.code} {detail}")
+
+
+# ───────────────────────── 认证 ─────────────────────────
+
 # 全局认证缓存（惰性加载）
 _auth_cache: tuple[str, str] | None = None
+_WORK_CRED_PATH = Path.home() / ".ethan" / "trae_work.json"
+
+
+def _load_work_cred() -> dict[str, Any] | None:
+    """从 ~/.ethan/trae_work.json 读 Work 凭证（trae_work_login.py 生成）。"""
+    if not _WORK_CRED_PATH.exists():
+        return None
+    try:
+        return json.loads(_WORK_CRED_PATH.read_text("utf-8"))
+    except Exception as e:
+        log.warning("Trae Work 凭证解析失败: %s", e)
+        return None
 
 
 def _auth() -> tuple[str, str]:
-    """获取 (token, user_id)：优先 .env，其次解密 storage.json。"""
+    """获取 (token, user_id)：优先 Work 凭证，其次 .env，最后解密 storage.json。"""
     global _auth_cache
     if _auth_cache:
+        return _auth_cache
+
+    # 0) Trae Work 凭证（trae_work_login.py 生成，独立账号体系）
+    work = _load_work_cred()
+    if work and work.get("access_token"):
+        _auth_cache = (work["access_token"], work.get("uid") or "")
+        log.info("Trae auth loaded via Work credentials (uid=%s)", work.get("uid"))
         return _auth_cache
 
     # 1) 环境变量 / .env
@@ -381,13 +567,14 @@ def _auth() -> tuple[str, str]:
         except Exception as e:
             log.debug("Trae %s auth failed: %s", edition, e)
 
-    raise HTTPException(status_code=401, detail="trae not authenticated - 请先登录 Trae IDE")
+    raise HTTPException(status_code=401, detail="trae not authenticated - 请先运行 trae_work_login.py 或登录 Trae IDE")
 
 
 # ───────────────────────── SSE 解析 ─────────────────────────
 
 # Trae 错误码 -> 友好中文文案（官方 docs.trae.ai/ide/error-codes）
 _TRAE_ERROR_HINTS: dict[int, str] = {
+    1005: "Trae plan 权益不足（当前账号/模型组合无权限，可检查会员套餐或换模型）",
     3003: "Trae 模型暂不可用（今日额度可能已用完，或当前模型无权限）",
     3004: "Trae 当前模型访问量过大，请稍后重试",
     4001: "Trae 服务端错误，请稍后重试",
