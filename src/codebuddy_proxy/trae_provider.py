@@ -781,3 +781,89 @@ class TraeProvider(BaseProvider):
                 "total_tokens": 0,
             },
         }
+
+
+# ───────────────────────── CLI 入口 ─────────────────────────
+
+def _cli() -> None:
+    """命令行工具：查询/领取积分、测试对话。示例：
+
+    python -m codebuddy_proxy.trae_provider status   # 签到/积分状态
+    python -m codebuddy_proxy.trae_provider claim    # 领取今日签到积分
+    python -m codebuddy_proxy.trae_provider usage    # 权益/用量
+    python -m codebuddy_proxy.trae_provider chat -m glm-5.2 -q "你好"
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="trae_provider",
+        description="Trae 账号工具（签到/积分/对话）",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("status", help="查询签到/积分状态")
+    sub.add_parser("claim", help="领取今日签到积分")
+    sub.add_parser("usage", help="查询权益/用量")
+    p_chat = sub.add_parser("chat", help="发一条对话测试")
+    p_chat.add_argument("-m", "--model", default="glm-5.2", help="模型名")
+    p_chat.add_argument("-q", "--query", default="用一句话介绍你自己", help="问题")
+    p_chat.add_argument("--stream", action="store_true", help="流式输出")
+
+    args = parser.parse_args()
+
+    if args.cmd == "status":
+        data = fetch_checkin_status()
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        if data.get("credits") is not None:
+            print(f"\n可用积分: {data['credits']} | 今日已签到: {data.get('checked_in')}")
+    elif args.cmd == "claim":
+        data = claim_checkin_credits()
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        if data.get("code") == 0:
+            print(f"\n✅ 签到成功，今日积分 +{data.get('credits_granted', '?')}")
+        else:
+            print(f"\n签到失败: {data.get('message', data)}")
+    elif args.cmd == "usage":
+        try:
+            token, uid = _auth()
+        except Exception:
+            work = _load_work_cred()
+            token, uid = work["access_token"], work.get("uid", "")
+        headers = _build_headers(token, uid)
+        headers["Accept"] = "application/json"
+        headers["X-User-Region"] = "CN"
+        req = urllib.request.Request(
+            _UG_API_HOST + "/trae/api/v2/pay/ide_user_ent_usage",
+            data=b"{}", headers=headers, method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        us = data.get("usage_summary", {})
+        print(f"总额度: {us.get('total_amount')} | 已用: {us.get('consumed_amount')} "
+              f"({us.get('consumption_ratio', 0) * 100:.1f}%)")
+        for p in data.get("user_entitlement_pack_list", []):
+            eb = p.get("entitlement_base_info", {})
+            print(f"权益包: {p.get('display_desc')} | status={eb.get('ent_status')} "
+                  f"| end={eb.get('end_time')} | endpoint={eb.get('available_endpoint')}")
+    elif args.cmd == "chat":
+        work = _load_work_cred()
+        if work:
+            raw = _send_trae_work_chat(
+                [{"role": "user", "content": [{"type": "text", "text": args.query}]}],
+                model=args.model, stream=True, work=work,
+            )
+        else:
+            raw = send_trae_chat(
+                [{"role": "user", "content": [{"type": "text", "text": args.query}]}],
+                model=args.model, stream=True,
+            )
+        for event, data in _parse_sse(raw):
+            if event == "output":
+                if data.get("reasoning_content"):
+                    print(f"[思考] {data['reasoning_content']}")
+                if data.get("response"):
+                    print(f"[回答] {data['response']}")
+
+
+if __name__ == "__main__":
+    _cli()
