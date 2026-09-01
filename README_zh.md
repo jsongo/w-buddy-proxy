@@ -70,6 +70,20 @@ uv run python -m codebuddy_proxy --desensitize --trae
 - **注意**：免费账号有日/周调用额度，耗尽时报 `4011`（今日用量已达上限），
   错误会以友好中文文案透传
 
+#### Trae 账号工具（`trae-cli`）
+
+安装后（`uv sync` / `pip install .`）自带 `trae-cli` 命令，可查询/领取签到积分、查看权益、测试对话：
+
+```bash
+uv run trae-cli status            # 签到/积分状态（剩余积分、今日是否已签到）
+uv run trae-cli claim             # 领取今日签到积分
+uv run trae-cli usage             # 权益/用量（总额、已用比例、权益包列表）
+uv run trae-cli chat -m glm-5.2 -q "你好"    # 发一条对话测试
+```
+
+认证自动加载：优先 Work 凭证 `~/.ethan/trae_work.json`（`trae_work_login.py` 登录生成），
+其次解密本机 Trae IDE `storage.json`，无需手动配置 token。
+
 ### 用 `proxy.sh` 后台管理（推荐）
 
 常驻后台运行时不用阻塞终端：

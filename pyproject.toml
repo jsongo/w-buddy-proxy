@@ -19,6 +19,7 @@ dev = [
 [project.scripts]
 w-buddy-proxy = "codebuddy_proxy.__main__:main"
 codebuddy-proxy = "codebuddy_proxy.__main__:main"
+trae-cli = "codebuddy_proxy.trae_provider:_cli"
 
 [build-system]
 requires = ["setuptools>=61", "wheel"]
