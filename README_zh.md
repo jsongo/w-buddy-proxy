@@ -16,6 +16,7 @@
 - **DSML 解析** — 自动识别并转换 DeepSeek Markup Language 工具调用
 - **流式输出** — SSE 实时返回，带空闲 / 总时长双重超时保护
 - **多账号** — 隔离的 session 文件，方便工作 / 个人账号切换
+- **多 Provider** — 除 CodeBuddy 外，可接入豆包（doubao2api）等其它模型源，统一经 `/v1/models` 列出、按模型名路由
 
 ---
 
@@ -213,9 +214,37 @@ providers:
 --no-browser              登录时不自动打开浏览器
 --verbose-llm             记录完整请求/响应体
 --mock-dir DIR            使用录制的响应（测试用）
+--doubao-base-url URL     豆包 doubao2api 服务地址（如 http://127.0.0.1:9090/v1），留空禁用豆包 provider
 ```
 
-环境变量：`CODEBUDDY_PROXY_HOST`、`CODEBUDDY_PROXY_PORT`、`CODEBUDDY_ENDPOINT`、`CODEBUDDY_PROXY_LOG_FILE`。
+环境变量：`CODEBUDDY_PROXY_HOST`、`CODEBUDDY_PROXY_PORT`、`CODEBUDDY_ENDPOINT`、`CODEBUDDY_PROXY_LOG_FILE`、`DOUBAO_BASE_URL`。
+
+---
+
+## 多 Provider（豆包等）
+
+workbuddy2api 除了默认的 CodeBuddy，还能接入其它模型源。当前内置了**豆包（doubao2api）**：
+
+```bash
+# 1. 先启动 doubao2api（豆包 OpenAI 兼容服务，端口 9090，扫码登录）
+#    见 https://github.com/wangchuxiaoji-oss/doubao2api
+
+# 2. 启动 workbuddy2api 时通过 --doubao-base-url 启用豆包 provider
+uv run python -m codebuddy_proxy --desensitize --doubao-base-url http://127.0.0.1:9090/v1
+```
+
+启用后，`/v1/models` 会合并列出 CodeBuddy + 豆包的模型，请求会按 `model` 名自动路由到对应上游：
+
+| 模型 id | 来源 | 说明 |
+|---|---|---|
+| `doubao` | 豆包 | 快速模式 |
+| `doubao-pro` | 豆包 | Pro |
+| `doubao-think` | 豆包 | 深度思考（思维链进 `reasoning_content`） |
+| `doubao-expert` | 豆包 | 专家模式 |
+| `glm-5.3` / `deepseek-v4-pro` / `auto` … | CodeBuddy | 原有模型，行为不变 |
+
+> ⚠️ 注意：豆包客户端模型**不支持 function calling / tool use**，仅适合对话、写作、
+> 识图、生图/视频等场景，不能作为 Claude Code / Codex 等 coding agent 的后端。
 
 ## API 端点
 

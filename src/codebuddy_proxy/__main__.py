@@ -36,6 +36,8 @@ import uvicorn
 from codebuddy_proxy.dsml_parser import DSMLStreamBuffer, parse_all_tool_calls, remove_all_tool_call_markers
 
 from codebuddy_proxy.codebuddy_client_demo import CodeBuddyClient, CodeBuddyError
+from codebuddy_proxy.providers import BaseProvider
+from codebuddy_proxy.doubao_provider import DoubaoProvider
 
 # 尝试导入高级功能模块（可选）
 try:
@@ -154,8 +156,11 @@ class ProxyState:
         verbose_llm: bool = False,
         logger: logging.Logger | None = None,
         json_logger: logging.Logger | None = None,
+        providers: dict[str, BaseProvider] | None = None,
     ):
         self.client = client
+        # 多 provider 支持：除默认 CodeBuddy 外的其它上游源（按 provider.id 索引）
+        self.providers: dict[str, BaseProvider] = providers or {}
         self.mock_dir = mock_dir
         self.log_file = log_file
         self.enable_desensitize = enable_desensitize
@@ -790,11 +795,14 @@ async def health():
     state = get_state()
     auth = {} if state.mock_dir is not None else (state.client.session.get("auth") or {})
     expires = int(auth.get("expiresAt") or 0)
+    # 附加各 provider 的健康信息（兼容无 providers 属性的旧构造）
+    providers_health = {pid: p.health() for pid, p in getattr(state, "providers", {}).items()}
     return {
         "status": "ok",
         "authenticated": bool(auth.get("accessToken")),
         "token_valid": not expires or expires > int(time.time() * 1000),
         "uptime_seconds": int(time.time() - state.started_at),
+        "providers": providers_health,
     }
 
 
@@ -807,6 +815,16 @@ async def list_models():
     state = get_state()
     # 从本地配置文件加载模型列表（离线可靠，无需认证）
     data = load_models_from_local_config()
+
+    # 合并其它 provider 的模型（如豆包）
+    for provider in getattr(state, "providers", {}).values():
+        for m in provider.models():
+            data.append({
+                "id": m.get("id"),
+                "name": m.get("description") or m.get("id"),
+                "vendor": provider.id,
+                "owned_by": provider.id,
+            })
 
     # 记录模型列表请求
     diagnostic(
@@ -984,58 +1002,118 @@ def _normalize_tool_choice(tool_choice: Any) -> Any:
     return tool_choice
 
 
+class CodeBuddyProvider(BaseProvider):
+    """默认的 CodeBuddy 上游，实现 BaseProvider 接口。
+
+    与豆包（DoubaoProvider）对称统一。CodeBuddy 的复杂转发逻辑
+    （SSE 解析、DSML、工具调用、协议转换）仍由本模块的
+    ``stream_upstream`` / ``collect_upstream`` / ``convert_nonstream``
+    承担，本类只做「认证 + 构造上游请求 + 分派流式/非流式」。
+    """
+
+    id = "codebuddy"
+    name = "CodeBuddy"
+
+    def models(self) -> list[dict[str, Any]]:
+        # CodeBuddy 的模型列表由 /v1/models 统一从本地配置加载，
+        # 此处返回空（不参与 provider 路由的模型合并，避免重复）。
+        return []
+
+    def ensure_auth(self) -> None:
+        state = get_state()
+        state.ensure_auth()
+
+    async def forward(
+        self,
+        body: dict[str, Any],
+        protocol: str,
+        original: dict[str, Any] | None = None,
+    ) -> StreamingResponse | JSONResponse:
+        state = get_state()
+        state.ensure_auth()
+
+        diagnostic("upstream_request", protocol=protocol, **body_summary(body))
+
+        stream = bool(body.get("stream"))
+        upstream_body = dict(body)
+
+        # 归一化 tool_choice：object 形式 → 函数名字符串（上游只接受 string）
+        if "tool_choice" in upstream_body:
+            upstream_body["tool_choice"] = _normalize_tool_choice(upstream_body["tool_choice"])
+
+        # 应用脱敏处理
+        if state.enable_desensitize:
+            upstream_body = desensitize_body(upstream_body, compact_harness=True)
+
+        # 始终以流式方式请求上游（聚合或转发）
+        upstream_body["stream"] = True
+        upstream_body.setdefault("stream_options", {"include_usage": True})
+
+        url = state.client.endpoint + "/v2/chat/completions"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; Genie-IDE/1.0)",
+            **state.client.auth_headers(),
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+
+        # 🔍 调试：输出实际发送的IDE识别headers
+        if state.logger:
+            ide_headers = {k: v for k, v in headers.items()
+                          if k.startswith("X-IDE-") or k == "X-Product-Version" or k == "X-Machine-Id"}
+            diagnostic("upstream_ide_headers", **ide_headers)
+
+        if stream:
+            # 流式：直接转发
+            return StreamingResponse(
+                stream_upstream(url, headers, upstream_body, protocol, original),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "close"}
+            )
+        else:
+            # 非流式：聚合后返回
+            collected = await collect_upstream(url, headers, upstream_body, protocol)
+            return JSONResponse(content=convert_nonstream(collected, protocol, original))
+
+
 async def forward_chat(
     body: dict[str, Any],
     protocol: str,
     original: dict[str, Any] | None = None
 ) -> StreamingResponse | JSONResponse:
-    """转发 chat 请求到 CodeBuddy 上游，支持流式和非流式。"""
+    """转发 chat 请求到上游，支持流式和非流式。
+
+    多 provider 路由：若请求模型命中某个非默认 provider（如豆包），
+    走该 provider 的 forward；否则走默认 CodeBuddy。
+    """
     state = get_state()
-    state.ensure_auth()
-    
-    diagnostic("upstream_request", protocol=protocol, **body_summary(body))
-    
-    stream = bool(body.get("stream"))
-    upstream_body = dict(body)
-    
-    # 归一化 tool_choice：object 形式 → 函数名字符串（上游只接受 string）
-    if "tool_choice" in upstream_body:
-        upstream_body["tool_choice"] = _normalize_tool_choice(upstream_body["tool_choice"])
-    
-    # 应用脱敏处理
-    if state.enable_desensitize:
-        upstream_body = desensitize_body(upstream_body, compact_harness=True)
-    
-    # 始终以流式方式请求上游（聚合或转发）
-    upstream_body["stream"] = True
-    upstream_body.setdefault("stream_options", {"include_usage": True})
-    
-    
-    url = state.client.endpoint + "/v2/chat/completions"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; Genie-IDE/1.0)",
-        **state.client.auth_headers(),
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream",
-    }
-    
-    # 🔍 调试：输出实际发送的IDE识别headers
-    if state.logger:
-        ide_headers = {k: v for k, v in headers.items() 
-                      if k.startswith("X-IDE-") or k == "X-Product-Version" or k == "X-Machine-Id"}
-        diagnostic("upstream_ide_headers", **ide_headers)
-    
-    if stream:
-        # 流式：直接转发
-        return StreamingResponse(
-            stream_upstream(url, headers, upstream_body, protocol, original),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "Connection": "close"}
-        )
-    else:
-        # 非流式：聚合后返回
-        collected = await collect_upstream(url, headers, upstream_body, protocol)
-        return JSONResponse(content=convert_nonstream(collected, protocol, original))
+
+    # ---- 多 provider 路由 ----
+    requested_model = body.get("model")
+    providers = getattr(state, "providers", {}) or {}
+    provider = None
+    for p in providers.values():
+        if any(m.get("id") == requested_model for m in p.models()):
+            provider = p
+            break
+    if provider is not None:
+        # 非默认 provider（豆包等）：仅 openai 协议透传（doubao2api 只支持
+        # OpenAI chat completions；responses/anthropic 协议由调用方决定，
+        # 这里统一按 openai 透传，客户端应使用 openai 协议接入）。
+        diagnostic("provider_route", provider=provider.id, model=requested_model, protocol=protocol)
+        try:
+            provider.ensure_auth()
+        except HTTPException:
+            raise
+        return await provider.forward(body, protocol, original)
+
+    # 默认 CodeBuddy 路径（对称封装，与其它 provider 一致）
+    return await _default_codebuddy.forward(body, protocol, original)
+
+
+# 默认 CodeBuddy provider 单例（供 forward_chat 默认路径调用）。
+# 定义在 CodeBuddyProvider 类之后，实例化安全。
+_default_codebuddy = CodeBuddyProvider()
 
 
 # ============================================================================
@@ -1785,6 +1863,8 @@ def main():
                         help="使用静态模型列表（默认从远程 API 动态获取）")
     parser.add_argument("--config-cache-ttl", type=int, default=int(os.getenv("CODEBUDDY_CONFIG_CACHE_TTL", "300")),
                         help="远程配置缓存 TTL（秒，默认 300）")
+    parser.add_argument("--doubao-base-url", default=os.getenv("DOUBAO_BASE_URL", ""),
+                        help="豆包 doubao2api 服务地址（如 http://127.0.0.1:9090/v1），留空则禁用豆包 provider")
     args = parser.parse_args()
     args.log_file = args.log_file.expanduser()
     
@@ -1799,6 +1879,16 @@ def main():
     # 处理登录
     if args.login:
         client.login(open_browser=not args.no_browser)
+
+    # 初始化额外 provider（豆包等）
+    providers: dict[str, BaseProvider] = {}
+    if args.doubao_base_url:
+        doubao = DoubaoProvider(args.doubao_base_url)
+        providers[doubao.id] = doubao
+        logger.info("Doubao provider enabled: base_url=%s", args.doubao_base_url)
+        print(f"[Doubao] Enabled (base_url={args.doubao_base_url})")
+    else:
+        print("[Doubao] Disabled (set --doubao-base-url or DOUBAO_BASE_URL to enable)")
     
     # 创建全局状态
     proxy_state = ProxyState(
@@ -1810,6 +1900,7 @@ def main():
         verbose_llm=args.verbose_llm,
         logger=logger,
         json_logger=json_logger,
+        providers=providers,
     )
     proxy_state.write_log(
         "startup",
