@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import platform
+import re
 import sys
 import time
 import urllib.request
@@ -396,9 +397,62 @@ def _map_model(requested: str) -> str:
     return MODEL_MAP.get(requested, requested)
 
 
+# 注入的 agent 协议压制指令（见 _extract_prompt 说明）
+_AGENT_GUARD = (
+    "当前环境是纯文本对话 API，没有任何命令执行、文件读写等工具，也没有 shell。"
+    "禁止输出任何工具调用标记（如 <Command>、<tool_action>、execute_command 等"
+    "XML 标签或伪协议块）。如问题看似需要执行命令/操作系统，直接用自然语言给出"
+    "回答或方案，示例命令用 markdown 代码块展示。"
+)
+
+# 输出侧兜底清洗：即使 system 注入失效，也把漏出的 agent 协议标记剥掉。
+# 实测泄漏格式（Trae agent 端点的服务端预设导致模型输出工具调用语法）：
+#   <Command len=22 id=0 run=1369463>\nlsof ...\n</Command>
+#   以及 tool_call 残留前缀、tool_action 块、think 标签、错误提示行。
+# 注意 <Command\\s 要求标签名后跟空白接属性（len=/id=/run=），避免误伤
+# <CommandBuffer> 这类正常技术词汇；正文中单独的 Command 单词不会匹配。
+_LEAK_RE = [
+    # 带属性签名的命令块（len=/id=，可带 tool_call 残留前缀；
+    # 上游泄漏格式可能残缺：< 不总存在、截断流可能没有 >）
+    re.compile(r"(?:</?\s*tool_call>\s*)?<?\s*Command\s+len=\d+\s+id=\d+[^>\n]*>?.*?</Command>", re.S),
+    re.compile(r"(?:</?\s*tool_call>\s*)?<?\s*Command\s+len=\d+\s+id=\d+[^>\n]*>?.*", re.S),  # 未闭合尾巴（截断流）
+    # 常规标签形态的命令块（backup）
+    re.compile(r"<Command\s[^>]*>.*?</Command>", re.S),
+    re.compile(r"<Command\s[^>]*>.*", re.S),
+    re.compile(r"<Command\s[^>]*>"),
+    re.compile(r"</Command>"),
+    # tool_action 完整块与孤立标签
+    re.compile(r"<tool_action[^>]*>.*?</tool_action>", re.S),
+    re.compile(r"</?\s*tool_action[^>]*>"),
+    # think 块（reasoning 泄漏到正文）与孤立 think 标签
+    re.compile(r"<think>.*?</think>", re.S),
+    re.compile(r"</?\s*think>"),
+    # 孤立 tool_call 标签
+    re.compile(r"</?\s*tool_call[^>]*>"),
+    # 工具执行失败的提示行
+    re.compile(r"执行过程发生错误[:：][^\n]*"),
+]
+
+
+def _sanitize_agent_leak(text: str) -> str:
+    """剥离上游 agent 协议残留（Command 块 / tool_call / tool_action 标签等）。"""
+    if not any(k in text for k in ("Command", "tool_call", "tool_action", "think", "执行过程发生错误")):
+        return text
+    for pat in _LEAK_RE:
+        text = pat.sub("", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
 def _extract_prompt(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """OpenAI messages -> Trae messages（content 转成 block 数组）。"""
-    out = []
+    """OpenAI messages -> Trae messages（content 转成 block 数组）。
+
+    同时注入 agent 协议压制指令：Trae 的 llm_utils_chat 端点（solo_work_lite/
+    chat_v3 等 function）服务端会给模型注入"你是带 shell 工具的 coding agent"
+    的预设，纯对话场景下模型会把 <Command>...</Command> 之类工具调用语法当
+    正文吐出来（下游 OpenAI 协议客户端不认识）。注入 system 指令压制之。
+    """
+    out: list[dict[str, Any]] = []
+    guard_merged = False
     for m in messages:
         role = m.get("role", "user")
         content = m.get("content", "")
@@ -411,7 +465,20 @@ def _extract_prompt(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             )
         else:
             text = ""
+        if role == "system" and not guard_merged:
+            # 合并进调用方自己的 system 消息，保持单条 system
+            out.append({
+                "role": "system",
+                "content": [{"type": "text", "text": _AGENT_GUARD + "\n\n" + text}],
+            })
+            guard_merged = True
+            continue
         out.append({"role": role, "content": [{"type": "text", "text": text}]})
+    if not guard_merged:
+        out.insert(0, {
+            "role": "system",
+            "content": [{"type": "text", "text": _AGENT_GUARD}],
+        })
     return out
 
 
@@ -748,7 +815,7 @@ class TraeProvider(BaseProvider):
                         in_thinking = True
                         yield chunk({"reasoning_content": data["reasoning_content"]})
                     if data.get("response"):
-                        yield chunk({"role": "assistant", "content": data["response"]})
+                        yield chunk({"role": "assistant", "content": _sanitize_agent_leak(data["response"])})
                         in_thinking = False
                 elif event == "done":
                     break
@@ -782,7 +849,7 @@ class TraeProvider(BaseProvider):
                     content_parts.append(data["response"])
 
         reasoning = "".join(reasoning_parts)
-        content = "".join(content_parts)
+        content = _sanitize_agent_leak("".join(content_parts))
         if not content and not reasoning:
             content = "(trae upstream 返回了空响应，未产生任何内容)"
         if reasoning:
