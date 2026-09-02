@@ -86,6 +86,9 @@ def main():
                         help="启用豆包 provider（自研内联，直连豆包工作 App CDP）")
     parser.add_argument("--trae", action="store_true", default=os.getenv("TRAE_ENABLED", "") == "1",
                         help="启用 Trae provider（解密 Trae IDE 登录态，直连底层模型）")
+    parser.add_argument("--default-provider", default=os.getenv("PROXY_DEFAULT_PROVIDER", "codebuddy"),
+                        help="兜底通道：模型名未命中任何 provider 时转发到哪个通道 "
+                             "（codebuddy/trae/doubao，默认 codebuddy；可用 PROXY_DEFAULT_PROVIDER 覆盖）")
     args = parser.parse_args()
     args.log_file = args.log_file.expanduser()
 
@@ -121,6 +124,15 @@ def main():
     else:
         print("[Trae] Disabled (pass --trae or TRAE_ENABLED=1 to enable)")
 
+    # 校验兜底通道：必须是 codebuddy 或已启用的 provider id
+    if args.default_provider != "codebuddy" and args.default_provider not in providers:
+        logger.warning(
+            "default-provider '%s' 未启用，回退为 codebuddy（已启用: %s）",
+            args.default_provider, list(providers) or "无",
+        )
+        args.default_provider = "codebuddy"
+    print(f"[Router] Default provider: {args.default_provider}")
+
     # 创建全局状态
     _state.proxy_state = ProxyState(
         client=client,
@@ -132,6 +144,7 @@ def main():
         logger=logger,
         json_logger=json_logger,
         providers=providers,
+        default_provider=args.default_provider,
     )
     _state.proxy_state.write_log(
         "startup",
