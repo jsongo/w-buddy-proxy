@@ -424,6 +424,12 @@ _LEAK_RE = [
     # tool_action 完整块与孤立标签
     re.compile(r"<tool_action[^>]*>.*?</tool_action>", re.S),
     re.compile(r"</?\s*tool_action[^>]*>"),
+    # 孤立的 tool_name / command 块（tool_action 外壳被剥离/缺失时，
+    # 内部标签会裸露——实测下游 coding agent 收到的正是这种残骸）
+    re.compile(r"<tool_name[^>]*>.*?</tool_name>", re.S),
+    re.compile(r"</?\s*tool_name[^>]*>"),
+    re.compile(r"<command>.*?</command>", re.S | re.I),
+    re.compile(r"</?\s*command>", re.I),
     # think 块（reasoning 泄漏到正文）与孤立 think 标签
     re.compile(r"<think>.*?</think>", re.S),
     re.compile(r"</?\s*think>"),
@@ -435,21 +441,139 @@ _LEAK_RE = [
 
 
 def _sanitize_agent_leak(text: str) -> str:
-    """剥离上游 agent 协议残留（Command 块 / tool_call / tool_action 标签等）。"""
-    if not any(k in text for k in ("Command", "tool_call", "tool_action", "think", "执行过程发生错误")):
+    """剥离上游 agent 协议残留（Command 块 / tool_call / tool_action 标签等）。
+
+    仅用于纯对话请求（_looks_like_agent_request 判定为 False）：coding agent
+    请求需要保留模型输出的工具调用语法（下游自己解析），不能走本函数。
+    """
+    if not any(k in text for k in (
+        "Command", "tool_call", "tool_action", "tool_name",
+        "<command", "think", "执行过程发生错误",
+    )):
         return text
     for pat in _LEAK_RE:
         text = pat.sub("", text)
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
-def _extract_prompt(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+# 泄漏标签名（流式扣留判断用；大小写不敏感）
+_LEAK_TAG_NAMES = ("tool_action", "tool_name", "tool_call", "think", "command")
+
+
+def _stream_hold_pos(buf: str) -> int:
+    """返回应扣留的起始位置（-1 表示整段可安全释放）。
+
+    两种扣留场景：
+    1. 存在未闭合的泄漏标签开启（如 <tool_action> 还没等到 </tool_action>）
+       ——必须等闭合标签到齐后整块清洗，否则会出现"剥了外壳留下内脏"
+       的残骸（下游收到的正是这种，解析器不认）
+    2. 尾部的裸 "<" 是某个泄漏标签名的前缀（如 "<tool_ac"）——扣住防止
+       标签名被 SSE 分包分裂
+    """
+    low = buf.lower()
+    best = -1
+    for tag in _LEAK_TAG_NAMES:
+        start = 0
+        opener = f"<{tag}"
+        while True:
+            i = low.find(opener, start)
+            if i == -1:
+                break
+            after = low[i + len(opener): i + len(opener) + 1]
+            if after in ("", ">", "/", " ", "\t", "\n"):
+                closer = f"</{tag}>"
+                if low.find(closer, i) == -1 and (best == -1 or i < best):
+                    best = i
+            start = i + 1
+    if best != -1:
+        return best
+    j = buf.rfind("<")
+    if j != -1 and ">" not in buf[j:]:
+        partial = buf[j + 1:].lower().lstrip("/")
+        if any(t.startswith(partial) for t in _LEAK_TAG_NAMES):
+            return j
+    return -1
+
+
+class _StreamLeakCleaner:
+    """流式泄漏清洗器：跨 chunk 缓冲 + 整块清洗。
+
+    之前的实现按 chunk 逐段调 _sanitize_agent_leak，标签跨 SSE 分包分裂时
+    整块正则匹配不上、孤儿标签正则只剥掉首尾外壳，内部内容反而漏出去。
+    本清洗器把"可能不完整"的尾部扣在缓冲区，只释放确定安全的前缀。
+    """
+
+    def __init__(self) -> None:
+        self._buf = ""
+
+    def feed(self, text: str) -> str:
+        self._buf += text
+        pos = _stream_hold_pos(self._buf)
+        if pos == -1:
+            safe, self._buf = self._buf, ""
+        else:
+            safe, self._buf = self._buf[:pos], self._buf[pos:]
+        return _sanitize_agent_leak(safe)
+
+    def flush(self) -> str:
+        out = _sanitize_agent_leak(self._buf)
+        self._buf = ""
+        return out
+
+
+def _looks_like_agent_request(messages: list[dict[str, Any]], body: dict[str, Any]) -> bool:
+    """判断请求是否来自自带工具协议的下游（coding agent / function calling）。
+
+    这类请求里模型输出的工具调用语法（<tool_action> 等）是下游 agent 自己
+    要解析的，不能注入压制指令、也不能清洗（实测模型会完美遵循下游 system
+    prompt 里教的格式；反而我们的 guard 注入会让模型输出两段指令打架的
+    纠结文本，逐 chunk 清洗会把 tool_action 外壳剥掉留下内脏残骸）。
+
+    判定信号（任一命中即视为 agent 请求）：
+    1. 请求带 tools / tool_choice 字段（标准 function calling）
+    2. messages 里有 role=tool/function 的消息（工具结果回传）
+    3. system 消息里有工具语法教学（<tool_action / <tool_name / tool_call /
+       execute_command 等）
+    4. 历史消息正文里出现过完整的工具调用块（agent 循环中的多轮请求）
+    """
+    if body.get("tools") or body.get("tool_choice") is not None:
+        return True
+    for m in messages:
+        role = m.get("role", "")
+        if role in ("tool", "function"):
+            return True
+        content = m.get("content", "")
+        if isinstance(content, list):
+            content = "".join(
+                p.get("text", "") for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+        if not isinstance(content, str) or not content:
+            continue
+        low = content.lower()
+        if role == "system":
+            if any(k in low for k in (
+                "<tool_action", "<tool_name", "tool_call", "<function_call",
+                "execute_command", "tool use", "工具调用", "你可以调用工具",
+            )):
+                return True
+        else:
+            # 非系统消息只认强信号：出现过完整的工具调用块
+            if "<tool_action" in low and "</tool_action>" in low:
+                return True
+    return False
+
+
+def _extract_prompt(messages: list[dict[str, Any]], guard: bool = True) -> list[dict[str, Any]]:
     """OpenAI messages -> Trae messages（content 转成 block 数组）。
 
-    同时注入 agent 协议压制指令：Trae 的 llm_utils_chat 端点（solo_work_lite/
-    chat_v3 等 function）服务端会给模型注入"你是带 shell 工具的 coding agent"
-    的预设，纯对话场景下模型会把 <Command>...</Command> 之类工具调用语法当
-    正文吐出来（下游 OpenAI 协议客户端不认识）。注入 system 指令压制之。
+    纯对话请求（guard=True）注入 agent 协议压制指令：Trae 的 llm_utils_chat
+    端点（solo_work_lite/chat_v3 等 function）服务端会给模型注入"你是带 shell
+    工具的 coding agent"的预设，纯对话场景下模型会把 <Command>...</Command>
+    之类工具调用语法当正文吐出来（下游 OpenAI 协议客户端不认识）。
+
+    coding agent 请求（guard=False，由 _looks_like_agent_request 判定）不注入：
+    下游 system prompt 自己教的工具格式模型会完美遵循，注入反而制造指令冲突。
     """
     out: list[dict[str, Any]] = []
     guard_merged = False
@@ -465,7 +589,7 @@ def _extract_prompt(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             )
         else:
             text = ""
-        if role == "system" and not guard_merged:
+        if guard and role == "system" and not guard_merged:
             # 合并进调用方自己的 system 消息，保持单条 system
             out.append({
                 "role": "system",
@@ -474,7 +598,7 @@ def _extract_prompt(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             guard_merged = True
             continue
         out.append({"role": role, "content": [{"type": "text", "text": text}]})
-    if not guard_merged:
+    if guard and not guard_merged:
         out.insert(0, {
             "role": "system",
             "content": [{"type": "text", "text": _AGENT_GUARD}],
@@ -770,23 +894,29 @@ class TraeProvider(BaseProvider):
         requested_model = body.get("model", "auto")
         messages = body.get("messages", [])
         stream = bool(body.get("stream", False))
+        # coding agent 请求：不注入 guard、不清洗——下游自己解析工具调用语法
+        agent_mode = _looks_like_agent_request(messages, body)
 
-        prompt = _extract_prompt(messages)
+        prompt = _extract_prompt(messages, guard=not agent_mode)
         if not prompt:
             raise HTTPException(status_code=400, detail="no text content")
 
         if stream:
             return StreamingResponse(
-                self._stream(prompt, requested_model),
+                self._stream(prompt, requested_model, sanitize=not agent_mode),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "Connection": "close"},
             )
         # 非流式聚合内部是同步 urllib 调用（最长 180s），放线程池执行，
         # 避免阻塞事件循环拖垮所有并发请求
-        collected = await asyncio.to_thread(self._collect, prompt, requested_model)
+        collected = await asyncio.to_thread(
+            self._collect, prompt, requested_model, not agent_mode
+        )
         return JSONResponse(content=collected)
 
-    def _stream(self, messages: list[dict[str, Any]], model: str) -> AsyncIterator[str]:
+    def _stream(
+        self, messages: list[dict[str, Any]], model: str, sanitize: bool = True
+    ) -> AsyncIterator[str]:
         """把 Trae SSE 转成 OpenAI chat.completion.chunk 流。"""
         request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
@@ -804,6 +934,7 @@ class TraeProvider(BaseProvider):
 
         try:
             raw = send_trae_chat(messages, model, stream=True, base_url=self._base_url)
+            cleaner = _StreamLeakCleaner() if sanitize else None
             for event, data in _parse_sse(raw):
                 if event == "error":
                     msg = _trae_error_text(data)
@@ -815,8 +946,12 @@ class TraeProvider(BaseProvider):
                         in_thinking = True
                         yield chunk({"reasoning_content": data["reasoning_content"]})
                     if data.get("response"):
-                        yield chunk({"role": "assistant", "content": _sanitize_agent_leak(data["response"])})
-                        in_thinking = False
+                        text = data["response"]
+                        if cleaner is not None:
+                            text = cleaner.feed(text)
+                        if text:
+                            yield chunk({"role": "assistant", "content": text})
+                            in_thinking = False
                 elif event == "done":
                     break
         except HTTPException as e:
@@ -826,11 +961,18 @@ class TraeProvider(BaseProvider):
         except Exception as e:
             log.error("Trae stream error: %s", e)
             yield chunk({"content": f"[Error: {e}]"})
+            return
 
+        if cleaner is not None:
+            tail = cleaner.flush()
+            if tail:
+                yield chunk({"role": "assistant", "content": tail})
         yield chunk({}, "stop")
         yield "data: [DONE]\n\n"
 
-    def _collect(self, messages: list[dict[str, Any]], model: str) -> dict[str, Any]:
+    def _collect(
+        self, messages: list[dict[str, Any]], model: str, sanitize: bool = True
+    ) -> dict[str, Any]:
         """非流式：聚合 Trae SSE 成完整响应。"""
         reasoning_parts: list[str] = []
         content_parts: list[str] = []
@@ -849,7 +991,9 @@ class TraeProvider(BaseProvider):
                     content_parts.append(data["response"])
 
         reasoning = "".join(reasoning_parts)
-        content = _sanitize_agent_leak("".join(content_parts))
+        content = "".join(content_parts)
+        if sanitize:
+            content = _sanitize_agent_leak(content)
         if not content and not reasoning:
             content = "(trae upstream 返回了空响应，未产生任何内容)"
         if reasoning:
