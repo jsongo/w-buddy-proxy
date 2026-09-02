@@ -172,12 +172,15 @@ async def forward_chat(
 ) -> StreamingResponse | JSONResponse:
     """转发 chat 请求到上游，支持流式和非流式。
 
-    多 provider 路由（两种方式）：
+    多 provider 路由（三种方式，优先级从高到低）：
     1. 显式前缀：``model: "<provider-id>/<model-name>"``，如
-       ``trae/DeepSeek-V4-Flash``、``doubao/doubao-think``；前缀命中已启用
-       的 provider 时，剥掉前缀再转发（前缀不匹配则把整串当普通模型名）。
+       ``trae/DeepSeek-V4-Flash``、``doubao/doubao-think``、
+       ``codebuddy/glm-5.3``；前缀命中已启用 provider（或 codebuddy）时，
+       剥掉前缀再转发，强制走指定通道。
     2. 自动匹配：模型 id 命中某个非默认 provider 的 models() 列表
-       （如豆包/Trae 模型），走该 provider 的 forward；否则走默认 CodeBuddy。
+       （如豆包/Trae 模型），走该 provider 的 forward。
+    3. 兜底通道：都未命中时，走 ``state.default_provider``（默认 codebuddy，
+       可通过 --default-provider / PROXY_DEFAULT_PROVIDER 改为 trae 等）。
     """
     state = get_state()
 
@@ -194,6 +197,12 @@ async def forward_chat(
             # 剥掉前缀后再转发（上游不认识 "trae/" 前缀）
             body = {**body, "model": real_model}
             requested_model = real_model
+        elif prefix == "codebuddy":
+            # 显式强制走默认 CodeBuddy 通道，跳过 provider 自动匹配与兜底
+            body = {**body, "model": real_model}
+            diagnostic("provider_route", provider="codebuddy", model=real_model,
+                       protocol=protocol, via="prefix")
+            return await _default_codebuddy.forward(body, protocol, original)
 
     # 2) 自动匹配模型 id
     if provider is None:
@@ -212,6 +221,18 @@ async def forward_chat(
         except HTTPException:
             raise
         return await provider.forward(body, protocol, original)
+
+    # 3) 兜底通道：未命中任何 provider 模型列表时，按配置的默认通道转发
+    default_provider_id = getattr(state, "default_provider", "codebuddy")
+    if default_provider_id in providers:
+        default_provider = providers[default_provider_id]
+        diagnostic("provider_route", provider=default_provider.id,
+                   model=requested_model, protocol=protocol, via="default")
+        try:
+            default_provider.ensure_auth()
+        except HTTPException:
+            raise
+        return await default_provider.forward(body, protocol, original)
 
     # 默认 CodeBuddy 路径（对称封装，与其它 provider 一致）
     return await _default_codebuddy.forward(body, protocol, original)

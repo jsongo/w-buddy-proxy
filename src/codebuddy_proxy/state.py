@@ -34,10 +34,14 @@ class ProxyState:
         logger: Optional[logging.Logger] = None,
         json_logger: Optional[logging.Logger] = None,
         providers: Optional[dict[str, BaseProvider]] = None,
+        default_provider: str = "codebuddy",
     ):
         self.client = client
         # 多 provider 支持：除默认 CodeBuddy 外的其它上游源（按 provider.id 索引）
         self.providers: dict[str, BaseProvider] = providers or {}
+        # 兜底通道：模型名未命中任何 provider 时转发到哪个通道
+        # （"codebuddy" 走默认 CodeBuddy；或填已启用 provider 的 id，如 "trae"）
+        self.default_provider = default_provider
         self.mock_dir = mock_dir
         self.log_file = log_file
         self.enable_desensitize = enable_desensitize
