@@ -90,8 +90,13 @@ async def list_models():
     state = get_state()
     # 从本地配置文件加载模型列表（离线可靠，无需认证）
     data = load_models_from_local_config()
+    # 标记通道归属：静态表中的模型走默认 CodeBuddy 通道
+    for m in data:
+        m.setdefault("provider", "codebuddy")
 
-    # 合并其它 provider 的模型（如豆包）
+    # 合并其它 provider 的模型（如豆包/Trae）。
+    # provider 字段标识该模型由哪个上游通道提供（codebuddy/trae/doubao），
+    # 与 owned_by（上游厂牌，如 zhipu）区分，便于客户端辨识。
     for provider in getattr(state, "providers", {}).values():
         for m in provider.models():
             data.append({
@@ -99,6 +104,7 @@ async def list_models():
                 "name": m.get("description") or m.get("id"),
                 "vendor": provider.id,
                 "owned_by": provider.id,
+                "provider": provider.id,
             })
 
     # 记录模型列表请求
@@ -115,6 +121,8 @@ async def list_models():
             "object": "model",
             "created": 1720872952,
             "owned_by": m.get("vendor") or "codebuddy",
+            # 通道归属：codebuddy（默认）/ trae / doubao ...
+            "provider": m.get("provider", "codebuddy"),
             "name": m.get("name") or m.get("id", "unknown"),
             "display_name": m.get("name") or m.get("id", "unknown"),
             "credits": m.get("credits"),
