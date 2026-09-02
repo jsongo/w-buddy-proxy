@@ -17,10 +17,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from codebuddy_proxy import __main__ as m
+from codebuddy_proxy import state as st
+from codebuddy_proxy import codebuddy_provider as cbp
 
 
 # ---------------------------------------------------------------------------
 # fixture：构造一个假的 ProxyState，并替换模块级 get_state()
+# （拆分后 get_state/collect_upstream/stream_upstream 分别位于 state 与
+#  codebuddy_provider 模块，monkeypatch 目标随之调整。）
 # ---------------------------------------------------------------------------
 def _make_state(client_mock=None):
     """构造一个最小可用的假 ProxyState（SimpleNamespace）。"""
@@ -33,6 +37,7 @@ def _make_state(client_mock=None):
 
     return SimpleNamespace(
         client=client,
+        providers={},
         mock_dir=None,
         started_at=time.time(),
         enable_desensitize=False,
@@ -48,9 +53,14 @@ def _make_state(client_mock=None):
 
 @pytest.fixture()
 def proxy_state(monkeypatch):
-    """为测试提供替换 get_state 的假 state。"""
+    """为测试提供替换 get_state 的假 state。
+
+    拆分后 get_state() 在 state 模块内读取模块级 proxy_state 变量，
+    故直接替换 st.proxy_state 即可让所有模块（routes/codebuddy_provider
+    等）拿到假 state。
+    """
     state = _make_state()
-    monkeypatch.setattr(m, "get_state", lambda: state)
+    monkeypatch.setattr(st, "proxy_state", state)
     return state
 
 
@@ -78,7 +88,7 @@ def test_health_unauthenticated(monkeypatch):
     """无 token 时 authenticated 应为 False。"""
     state = _make_state()
     state.client.session = {}  # 无 auth
-    monkeypatch.setattr(m, "get_state", lambda: state)
+    monkeypatch.setattr(st, "proxy_state", state)
     c = TestClient(m.app)
     body = c.get("/health").json()
     assert body["authenticated"] is False
@@ -161,7 +171,7 @@ def _fake_collected():
 def test_chat_completions_nonstream(client, monkeypatch):
     async def fake_collect(*args, **kwargs):
         return _fake_collected()
-    monkeypatch.setattr(m, "collect_upstream", fake_collect)
+    monkeypatch.setattr(cbp, "collect_upstream", fake_collect)
 
     r = client.post("/v1/chat/completions", json={
         "model": "glm-5.3",
@@ -187,7 +197,7 @@ def test_responses_nonstream(client, monkeypatch):
             + "\n\n"
         ).encode()
         yield b"data: [DONE]\n\n"
-    monkeypatch.setattr(m, "stream_upstream", fake_stream)
+    monkeypatch.setattr(cbp, "stream_upstream", fake_stream)
 
     r = client.post("/v1/responses", json={
         "model": "glm-5.3",
@@ -207,7 +217,7 @@ def test_responses_nonstream(client, monkeypatch):
 def test_messages_nonstream(client, monkeypatch):
     async def fake_collect(*args, **kwargs):
         return _fake_collected()
-    monkeypatch.setattr(m, "collect_upstream", fake_collect)
+    monkeypatch.setattr(cbp, "collect_upstream", fake_collect)
 
     r = client.post("/v1/messages", json={
         "model": "claude-4.0-sonnet",
@@ -228,7 +238,7 @@ def test_gbk_request_body(client, monkeypatch):
     """parse_request_body 要能处理 GBK 编码的请求体，不应 500。"""
     async def fake_collect(*args, **kwargs):
         return _fake_collected()
-    monkeypatch.setattr(m, "collect_upstream", fake_collect)
+    monkeypatch.setattr(cbp, "collect_upstream", fake_collect)
 
     gbk_payload = (
         '{"model":"glm-5.3","messages":[{"role":"user","content":"\u4f60\u597d"}]}'

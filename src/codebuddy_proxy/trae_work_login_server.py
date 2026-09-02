@@ -9,7 +9,10 @@
 """
 from __future__ import annotations
 
+import html
 import json
+import os
+import secrets
 import sys
 import time
 import urllib.error
@@ -24,7 +27,25 @@ CLIENT_ID = "en1oxy7wnw8j9n"
 APP_VERSION = "0.1.43"
 API_HOST = "https://api.trae.com.cn"
 OUT_PATH = Path.home() / ".ethan" / "trae_work.json"
+# 与 trae_work_login.py 共享的本次登录状态（nonce + machine_id/device_id）
+STATE_PATH = Path("/tmp/trae_work_login_state.json")
+STATE_TTL = 900  # 状态有效期（秒）
 PORT = 18080
+
+
+def _load_login_state() -> dict:
+    try:
+        return json.loads(STATE_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def _write_cred_secure(path: Path, data: dict) -> None:
+    """以 0600 权限原子创建凭证文件（避免 write_text 后 chmod 前的短暂 0644 窗口）。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(json.dumps(data, ensure_ascii=False, indent=2))
 
 
 def _http_post_json(url: str, body: dict, headers: dict, timeout: int = 60) -> dict:
@@ -113,6 +134,13 @@ def test_work_chat(work: dict) -> str:
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _reject(self, msg: str) -> None:
+        self.send_response(403)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(msg.encode())
+        print(f"[!] 拒绝回调: {msg}", file=sys.stderr)
+
     def do_GET(self):
         """捕获 /authorize 回调。"""
         if not self.path.startswith("/authorize"):
@@ -130,6 +158,31 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+        # nonce 校验：回调必须携带 trae_work_login.py 生成的 state 文件中
+        # 的一次性 nonce，防止本机恶意网页直接 GET 注入伪造 refreshToken
+        # 覆盖用户凭证（否则后续对话会被发到攻击者账号）
+        login_state = _load_login_state()
+        expected_nonce = login_state.get("nonce") or ""
+        created_at = int(login_state.get("created_at") or 0)
+        callback_nonce = (qs.get("nonce") or [""])[0]
+        if not expected_nonce:
+            self._reject(
+                "<h3>回调被拒绝</h3><p>未找到登录状态（nonce 缺失）。"
+                "请先运行 trae_work_login.py 生成登录链接后再走服务器回调流程</p>"
+            )
+            return
+        if time.time() - created_at > STATE_TTL:
+            self._reject(
+                "<h3>回调被拒绝</h3><p>登录状态已过期（超过 15 分钟），"
+                "请重新运行 trae_work_login.py 生成新的登录链接</p>"
+            )
+            return
+        if not callback_nonce or not secrets.compare_digest(callback_nonce, expected_nonce):
+            self._reject(
+                "<h3>回调被拒绝</h3><p>nonce 校验失败（回调可能被伪造）</p>"
+            )
+            return
+
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
@@ -143,8 +196,6 @@ class Handler(BaseHTTPRequestHandler):
         try:
             cred = exchange_token(refresh_token)
             user = get_user_info(cred["access_token"])
-            state_path = Path("/tmp/trae_work_login_state.json")
-            state = json.loads(state_path.read_text()) if state_path.exists() else {}
             out = {
                 "uid": user.get("uid") or "",
                 "nickname": user.get("nickname") or "",
@@ -153,15 +204,13 @@ class Handler(BaseHTTPRequestHandler):
                 "refresh_token": cred["refresh_token"],
                 "expires_at": cred["expires_at"],
                 "api_host": API_HOST,
-                "machine_id": state.get("machine_id", ""),
-                "device_id": state.get("device_id", ""),
+                "machine_id": login_state.get("machine_id", ""),
+                "device_id": login_state.get("device_id", ""),
             }
-            OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-            OUT_PATH.write_text(json.dumps(out, ensure_ascii=False, indent=2), "utf-8")
-            import os
-
-            os.chmod(OUT_PATH, 0o600)
-            msg = f"<h3>登录成功！</h3><p>uid={out['uid']} nickname={out['nickname']}</p><p>凭证已保存，可以关闭此页面</p>"
+            _write_cred_secure(OUT_PATH, out)
+            # 一次性消费：成功落盘后删除状态文件，重放/重复回调一律拒绝
+            STATE_PATH.unlink(missing_ok=True)
+            msg = f"<h3>登录成功！</h3><p>uid={html.escape(out['uid'])} nickname={html.escape(out['nickname'])}</p><p>凭证已保存，可以关闭此页面</p>"
             self.wfile.write(msg.encode())
             print(f"\n[OK] 凭证已保存: {OUT_PATH}")
             print(f"    uid={out['uid']} nickname={out['nickname']}")
@@ -173,12 +222,10 @@ class Handler(BaseHTTPRequestHandler):
                 raw = test_work_chat(out)
                 print("=== Work chat 响应 ===")
                 print(raw[:500])
-                # 写个标记文件让外部知道完成
-                Path("/tmp/trae_work_login_done").write_text("done")
             except Exception as e:
                 print(f"[!] Work chat 测试失败: {e}")
         except Exception as e:
-            msg = f"<h3>换 token 失败</h3><p>{e}</p>"
+            msg = f"<h3>换 token 失败</h3><p>{html.escape(str(e))}</p>"
             self.wfile.write(msg.encode())
             print(f"[!] 失败: {e}", file=sys.stderr)
 

@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -153,7 +154,7 @@ def decrypt_storage_value(base64_value: str) -> str:
     # 检测加密类型
     if header[:2] == b"\x74\x63" and header[2:6] == b"\x05\x10\x00\x00":
         salt = _xor_bytes(_SALT_A, _SALT_B)
-    elif header[:2] == b"\x12\x39\x20\x20\x02\x03":
+    elif header[:6] == b"\x12\x39\x20\x20\x02\x03":
         salt = _xor_bytes(_SALT_C, _SALT_D)
     else:
         raise ValueError(f"未知加密类型: {header.hex()}")
@@ -526,7 +527,7 @@ def _load_work_cred() -> dict[str, Any] | None:
 
 
 def _auth() -> tuple[str, str]:
-    """获取 (token, user_id)：优先 Work 凭证，其次 .env，最后解密 storage.json。"""
+    """获取 (token, user_id)：优先 Work 凭证，其次环境变量，最后解密 storage.json。"""
     global _auth_cache
     if _auth_cache:
         return _auth_cache
@@ -538,19 +539,9 @@ def _auth() -> tuple[str, str]:
         log.info("Trae auth loaded via Work credentials (uid=%s)", work.get("uid"))
         return _auth_cache
 
-    # 1) 环境变量 / .env
+    # 1) 环境变量（TRAE_TOKEN / TRAE_USER_ID）
     token = os.environ.get("TRAE_TOKEN", "")
     user_id = os.environ.get("TRAE_USER_ID", "")
-    if not token:
-        # 尝试 trae-local-api 的 .env
-        env_path = Path.home() / "code" / "others" / "trae-local-api" / ".env"
-        if env_path.exists():
-            for line in env_path.read_text().splitlines():
-                line = line.strip()
-                if line.startswith("TRAE_TOKEN="):
-                    token = line.split("=", 1)[1]
-                elif line.startswith("TRAE_USER_ID="):
-                    user_id = line.split("=", 1)[1]
     if token:
         _auth_cache = (token, user_id)
         return _auth_cache
@@ -694,7 +685,10 @@ class TraeProvider(BaseProvider):
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "Connection": "close"},
             )
-        return JSONResponse(content=self._collect(prompt, requested_model))
+        # 非流式聚合内部是同步 urllib 调用（最长 180s），放线程池执行，
+        # 避免阻塞事件循环拖垮所有并发请求
+        collected = await asyncio.to_thread(self._collect, prompt, requested_model)
+        return JSONResponse(content=collected)
 
     def _stream(self, messages: list[dict[str, Any]], model: str) -> AsyncIterator[str]:
         """把 Trae SSE 转成 OpenAI chat.completion.chunk 流。"""
@@ -762,8 +756,12 @@ class TraeProvider(BaseProvider):
         content = "".join(content_parts)
         if not content and not reasoning:
             content = "(trae upstream 返回了空响应，未产生任何内容)"
-        if reasoning and content:
-            content = f"<think>\n{reasoning}\n</think>\n\n{content}"
+        if reasoning:
+            if content:
+                content = f"<think>\n{reasoning}\n</think>\n\n{content}"
+            else:
+                # 只有思维链没有正文时，别把 reasoning 整个丢掉
+                content = f"<think>\n{reasoning}\n</think>"
 
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
@@ -807,7 +805,6 @@ def _cli() -> None:
     p_chat = sub.add_parser("chat", help="发一条对话测试")
     p_chat.add_argument("-m", "--model", default="glm-5.2", help="模型名")
     p_chat.add_argument("-q", "--query", default="用一句话介绍你自己", help="问题")
-    p_chat.add_argument("--stream", action="store_true", help="流式输出")
 
     args = parser.parse_args()
 
@@ -827,8 +824,11 @@ def _cli() -> None:
         try:
             token, uid = _auth()
         except Exception:
-            work = _load_work_cred()
-            token, uid = work["access_token"], work.get("uid", "")
+            work = _load_work_cred() or {}
+            token, uid = work.get("access_token", ""), work.get("uid", "")
+            if not token:
+                print("Trae 未认证：请先运行 trae_work_login.py 登录，或设置 TRAE_TOKEN 环境变量")
+                return
         headers = _build_headers(token, uid)
         headers["Accept"] = "application/json"
         headers["X-User-Region"] = "CN"
@@ -846,18 +846,18 @@ def _cli() -> None:
             print(f"权益包: {p.get('display_desc')} | status={eb.get('ent_status')} "
                   f"| end={eb.get('end_time')} | endpoint={eb.get('available_endpoint')}")
     elif args.cmd == "chat":
-        work = _load_work_cred()
-        if work:
-            raw = _send_trae_work_chat(
-                [{"role": "user", "content": [{"type": "text", "text": args.query}]}],
-                model=args.model, stream=True, work=work,
-            )
-        else:
-            raw = send_trae_chat(
-                [{"role": "user", "content": [{"type": "text", "text": args.query}]}],
-                model=args.model, stream=True,
-            )
+        # send_trae_chat 内部会自动路由 Work 通道（有 Work 凭证时），
+        # 无需在此重复 if/else 分派
+        raw = send_trae_chat(
+            [{"role": "user", "content": [{"type": "text", "text": args.query}]}],
+            model=args.model, stream=True,
+        )
         for event, data in _parse_sse(raw):
+            if event == "error":
+                # Trae 走 HTTP 200 + event: error（如免费账号撞 4011 限额），
+                # 必须显式报错退出，否则打印空白像成功
+                print(f"[错误] {_trae_error_text(data)}", file=sys.stderr)
+                sys.exit(1)
             if event == "output":
                 if data.get("reasoning_content"):
                     print(f"[思考] {data['reasoning_content']}")

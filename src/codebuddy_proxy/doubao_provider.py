@@ -15,6 +15,7 @@ App 的内置 Chromium，在页面 JS 环境里 fetch 自动注入 a_bogus 风�
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -80,6 +81,8 @@ class DoubaoProvider(BaseProvider):
         self._client = CDPDoubaoClient()
         self._startup_timeout = startup_timeout
         self._started = False
+        # 防止并发首请求双重启动（双开 Helper / 重复连接 CDP）
+        self._start_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # BaseProvider 接口
@@ -105,19 +108,22 @@ class DoubaoProvider(BaseProvider):
         return
 
     async def _ensure_started(self) -> None:
-        """异步确保 CDPDoubaoClient 已启动（惰性启动）。"""
+        """异步确保 CDPDoubaoClient 已启动（惰性启动，加锁防并发双重启动）。"""
         if self._started:
             return
-        log.info("DoubaoProvider: starting CDP client")
-        try:
-            await self._client.start()
-            self._started = True
-        except Exception as exc:
-            log.error("DoubaoProvider: client start failed: %s", exc)
-            raise HTTPException(
-                status_code=502,
-                detail=f"doubao client start failed: {exc}",
-            ) from exc
+        async with self._start_lock:
+            if self._started:  # 双重检查：等锁期间可能已被并发请求启动
+                return
+            log.info("DoubaoProvider: starting CDP client")
+            try:
+                await self._client.start()
+                self._started = True
+            except Exception as exc:
+                log.error("DoubaoProvider: client start failed: %s", exc)
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"doubao client start failed: {exc}",
+                ) from exc
 
     async def forward(
         self,
@@ -245,6 +251,7 @@ class DoubaoProvider(BaseProvider):
                     status = event.get("status", 0)
                     body_text = event.get("body", "")
                     log.error("doubao stream error %s: %s", status, body_text[:200])
+                    self._client.record_failure(status or 0)
                     yield f"data: {json.dumps(_chunk({'content': f'[Error {status}]'}), ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
@@ -342,6 +349,7 @@ class DoubaoProvider(BaseProvider):
                 bot_id=bot_id or None,
             ):
                 if event.get("error"):
+                    self._client.record_failure(event.get("status") or 0)
                     raise RuntimeError(
                         f"API error {event.get('status')}: {event.get('body', '')[:200]}"
                     )

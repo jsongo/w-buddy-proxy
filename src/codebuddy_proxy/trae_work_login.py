@@ -27,6 +27,10 @@ APP_VERSION = "0.1.43"
 API_HOST = "https://api.trae.com.cn"
 AUTH_HOST = "https://www.trae.cn/authorization"
 OUT_PATH = Path.home() / ".ethan" / "trae_work.json"
+# 供 trae_work_login_server.py 读取的本次登录状态（随机 id，非机密）
+STATE_PATH = Path("/tmp/trae_work_login_state.json")
+# 登录状态有效期（秒）：超时后 server 拒绝回调
+STATE_TTL = 900
 
 
 def _http_post_json(url: str, body: dict, headers: dict, timeout: int = 60) -> dict:
@@ -41,6 +45,9 @@ def _http_post_json(url: str, body: dict, headers: dict, timeout: int = 60) -> d
 def build_login_url() -> tuple[str, str, str]:
     machine_id = secrets.token_hex(16)
     device_id = secrets.token_hex(16)
+    # 一次性 nonce：server 只接受带匹配 nonce 的回调，防止本机恶意网页
+    # 直接 GET /authorize 注入伪造 refreshToken 覆盖凭证
+    nonce = secrets.token_hex(16)
     params = {
         "login_version": "1",
         "auth_from": "solo",
@@ -50,7 +57,7 @@ def build_login_url() -> tuple[str, str, str]:
         "client_id": CLIENT_ID,
         "redirect": "0",
         "login_trace_id": secrets.token_hex(8),
-        "auth_callback_url": "http://127.0.0.1:18080/authorize",
+        "auth_callback_url": f"http://127.0.0.1:18080/authorize?nonce={nonce}",
         "machine_id": machine_id,
         "device_id": device_id,
         "x_device_id": device_id,
@@ -62,6 +69,14 @@ def build_login_url() -> tuple[str, str, str]:
         "x_app_type": "stable",
     }
     url = AUTH_HOST + "?" + urllib.parse.urlencode(params)
+    # 状态文件供 trae_work_login_server.py 使用：machine_id/device_id 必须
+    # 复用同一对（避免每请求随机指纹触发风控），nonce 用于回调防伪造
+    STATE_PATH.write_text(json.dumps({
+        "machine_id": machine_id,
+        "device_id": device_id,
+        "nonce": nonce,
+        "created_at": int(time.time()),
+    }))
     return url, machine_id, device_id
 
 
@@ -155,8 +170,10 @@ def main() -> int:
         "device_id": device_id,
     }
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    OUT_PATH.write_text(json.dumps(out, ensure_ascii=False, indent=2), "utf-8")
-    os.chmod(OUT_PATH, 0o600)
+    # 直接以 0600 权限创建（避免 write_text 后 chmod 前的短暂 0644 窗口）
+    fd = os.open(OUT_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(json.dumps(out, ensure_ascii=False, indent=2))
     print()
     print(f"[OK] 凭证已保存: {OUT_PATH}")
     print(f"    uid={out['uid']} nickname={out['nickname']} expires={out['expires_at']}")

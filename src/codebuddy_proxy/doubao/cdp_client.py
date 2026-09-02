@@ -35,6 +35,7 @@ import os
 import socket
 import struct
 import subprocess
+import threading
 import time
 import urllib.request
 import uuid
@@ -168,6 +169,9 @@ class CDPDoubaoClient:
         self._web_id: str = ""
         self._consecutive_failures = 0
         self._last_error_code = 0
+        # 所有 CDP 命令（含 to_thread 并发调用）都经此锁串行化，
+        # 避免多请求同时读写同一 WebSocket 导致 id 串号 / 响应丢失 / 串流。
+        self._ws_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # 状态
@@ -222,21 +226,22 @@ class CDPDoubaoClient:
     async def start(self) -> None:
         """确保 CDP 可用：优先复用主 App（共存，不杀用户进程），兜底独立 Helper。"""
         # 1) 端口已有 CDP 直接复用（主 App 正在跑且开了调试端口）
-        if self._probe_cdp():
+        if await asyncio.to_thread(self._probe_cdp):
             log.info("CDPDoubaoClient: reuse existing CDP on port %d", self.port)
             await self._connect_chat()
             return
 
         # 2) 尝试拉起主 App（不杀进程；主 App 自带 saman-from-chat 开 CDP）
         try:
-            subprocess.run(
+            await asyncio.to_thread(
+                subprocess.run,
                 ["open", "-a", "DoubaoWork", "--args", f"--remote-debugging-port={self.port}"],
                 capture_output=True,
                 timeout=10,
             )
             for _ in range(30):
                 await asyncio.sleep(1)
-                if self._probe_cdp():
+                if await asyncio.to_thread(self._probe_cdp):
                     log.info("CDPDoubaoClient: 主 App CDP ready on port %d", self.port)
                     await self._connect_chat()
                     return
@@ -244,8 +249,26 @@ class CDPDoubaoClient:
         except Exception as e:
             log.warning("CDPDoubaoClient: 主 App 拉起异常（%s），回退独立 Helper", e)
 
-        # 3) 兜底：独立 Helper（此时才清理残留进程，否则单例锁拦截）
-        subprocess.run(["pkill", "-KILL", "-f", "DoubaoWork"], check=False)
+        # 3) 兜底：独立 Helper。
+        # 注意：主 App 正在运行但没开调试口时（open -a 对已运行实例只激活、
+        # 不传参），绝不能 pkill 用户正在用的豆包 App —— 明确报错让用户决策。
+        main_app_running = (
+            await asyncio.to_thread(
+                subprocess.run,
+                ["pgrep", "-f", "DoubaoWork.app/Contents/MacOS/DoubaoWork"],
+                capture_output=True,
+            )
+        ).returncode == 0
+        if main_app_running:
+            raise RuntimeError(
+                "豆包主 App 正在运行但未开启 CDP 调试端口（无法给已运行的实例"
+                "追加启动参数）。请先完全退出豆包（Cmd+Q）后重试；代理不会强杀"
+                "正在使用的豆包 App。"
+            )
+        # 主 App 确认未运行时才清理残留 Helper 进程（否则单例锁拦截）
+        await asyncio.to_thread(
+            subprocess.run, ["pkill", "-KILL", "-f", "DoubaoWork"], check=False
+        )
         await asyncio.sleep(2)
         cmd = [self.helper_bin, f"--remote-debugging-port={self.port}", *_STABLE_FLAGS]
         self._proc = subprocess.Popen(
@@ -278,15 +301,20 @@ class CDPDoubaoClient:
     # 内部：CDP 辅助
     # ------------------------------------------------------------------
 
-    def _evaluate(self, expr: str, timeout: float = 30.0) -> Any:
-        """同步执行 Runtime.evaluate（返回 JS 值或错误标记）。"""
+    def _evaluate(self, expr: str, timeout: float = 30.0, await_promise: bool = True) -> Any:
+        """同步执行 Runtime.evaluate（返回 JS 值或错误标记）。
+
+        经 ``_ws_lock`` 串行化：并发请求（to_thread 调用）不会交叉读写
+        同一 WebSocket，避免 CDP 响应 id 串号。
+        """
         if not self._ws:
             raise RuntimeError("CDP not connected")
-        r = self._ws.cmd(
-            "Runtime.evaluate",
-            {"expression": expr, "returnByValue": True, "awaitPromise": True},
-            timeout=timeout,
-        )
+        with self._ws_lock:
+            r = self._ws.cmd(
+                "Runtime.evaluate",
+                {"expression": expr, "returnByValue": True, "awaitPromise": await_promise},
+                timeout=timeout,
+            )
         result = r.get("result", {})
         if "exceptionDetails" in result:
             desc = (
@@ -296,20 +324,22 @@ class CDPDoubaoClient:
             return {"ERROR": str(desc)[:500]}
         return result.get("result", {}).get("value")
 
+    def _fetch_targets(self) -> list[dict[str, Any]]:
+        """同步拉取 /json/list（失败返回空列表）。"""
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{self.port}/json/list", timeout=2
+            ) as resp:
+                return json.loads(resp.read())
+        except Exception:
+            return []
+
     async def _wait_for_target(self, timeout: float = 60.0) -> dict[str, Any] | None:
         deadline = time.time() + timeout
         while time.time() < deadline:
-            try:
-                ts = json.loads(
-                    urllib.request.urlopen(
-                        f"http://127.0.0.1:{self.port}/json/list", timeout=2
-                    ).read()
-                )
-                for t in ts:
-                    if t.get("type") == "page" or "chat" in t.get("url", ""):
-                        return t
-            except Exception:
-                pass
+            for t in await asyncio.to_thread(self._fetch_targets):
+                if t.get("type") == "page" or "chat" in t.get("url", ""):
+                    return t
             await asyncio.sleep(0.2)
         return None
 
@@ -535,8 +565,9 @@ class CDPDoubaoClient:
         }})()
         """
 
-        # 启动后台 JS（awaitPromise=False，后台持续跑）
-        self._ws.cmd("Runtime.evaluate", {"expression": js, "awaitPromise": False})
+        # 启动后台 JS（awaitPromise=False，后台持续跑；经 _ws_lock 串行化，
+        # 不阻塞事件循环）
+        await asyncio.to_thread(self._evaluate, js, 10.0, False)
 
         # 轮询队列：每次取走一批事件
         drain_js = (
@@ -545,8 +576,10 @@ class CDPDoubaoClient:
             f" const batch = q.splice(0, q.length);"
             f" return JSON.stringify(batch); }})()"
         )
-        deadline = time.time() + 180.0
-        while time.time() < deadline:
+        # 空闲超时：以「最近一次收到数据」计，长回复（>180s 仍在出数据）不会被误杀
+        idle_timeout = 180.0
+        last_activity = time.time()
+        while time.time() - last_activity < idle_timeout:
             await asyncio.sleep(0.15)
             r = await asyncio.to_thread(self._evaluate, drain_js, 10.0)
             if not isinstance(r, str):
@@ -555,17 +588,22 @@ class CDPDoubaoClient:
                 batch = json.loads(r)
             except json.JSONDecodeError:
                 continue
+            if batch:
+                last_activity = time.time()
             for item in batch:
                 if item == "__DONE__":
+                    await self._cleanup_queue(queue_name)
                     return
                 if item.startswith("__ERROR__:"):
                     yield {"error": True, "status": 0, "body": item[len("__ERROR__:"):]}
+                    await self._cleanup_queue(queue_name)
                     return
                 if item.startswith("__HTTP_ERROR__:"):
                     rest = item[len("__HTTP_ERROR__:"):]
                     status = int(rest.split(":", 1)[0])
                     body = rest.split(":", 1)[1] if ":" in rest else ""
                     yield {"error": True, "status": status, "body": body}
+                    await self._cleanup_queue(queue_name)
                     return
                 if item.startswith("__HTTP_STATUS__:"):
                     continue
@@ -575,7 +613,19 @@ class CDPDoubaoClient:
                 except json.JSONDecodeError:
                     continue
         # 超时
-        yield {"error": True, "status": 0, "body": "Stream timeout (180s)"}
+        await self._cleanup_queue(queue_name)
+        yield {"error": True, "status": 0, "body": f"Stream idle timeout ({idle_timeout:.0f}s)"}
+
+    async def _cleanup_queue(self, queue_name: str) -> None:
+        """删除页面侧轮询队列，避免长会话下浏览器内存无界增长。"""
+        try:
+            await asyncio.to_thread(
+                self._evaluate,
+                f"delete window[{json.dumps(queue_name)}]",
+                5.0,
+            )
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # SSE 解析辅助（与 BrowserClient 对齐）
