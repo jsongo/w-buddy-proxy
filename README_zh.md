@@ -16,6 +16,7 @@
 - **DSML 解析** — 自动识别并转换 DeepSeek Markup Language 工具调用
 - **流式输出** — SSE 实时返回，带空闲 / 总时长双重超时保护
 - **多账号** — 隔离的 session 文件，方便工作 / 个人账号切换
+- **多 Provider** — 除 CodeBuddy 外，内置豆包（纯 stdlib CDP 直连豆包工作 App），统一经 `/v1/models` 列出、按模型名路由
 
 ---
 
@@ -35,6 +36,53 @@ uv run python -m codebuddy_proxy --login --desensitize
 ```
 
 默认监听 `http://127.0.0.1:8787`。
+
+### 豆包 Provider（可选）
+
+除 CodeBuddy 外，内置豆包 provider（纯 stdlib CDP 直连本地「豆包工作」App，零额外依赖）：
+
+```bash
+# 启用豆包 provider（需要本机已安装并登录豆包工作 App）
+uv run python -m codebuddy_proxy --desensitize --doubao
+```
+
+- **原理**：复用豆包工作 App 的登录态与内置 Chromium（CDP 直连），在页面 JS 环境 fetch
+  自动注入 a_bogus 风控签名，无需扫码、无需额外凭证
+- **模型**：`doubao`（快速）、`doubao-pro`、`doubao-think`（深度思考）、`doubao-expert`（专家）
+- **依赖**：纯 Python 标准库，不需要 Playwright / chromium
+- **CDP 模式**：默认优先复用主 App（`open -a DoubaoWork --args --remote-debugging-port=9223`，
+  不杀用户进程）；主 App 不可用时回退独立 Helper
+
+### Trae Provider（可选）
+
+除 CodeBuddy 和豆包外，内置 Trae provider（解密 Trae IDE 登录态，直连底层模型）：
+
+```bash
+# 启用 Trae provider（需要本机已安装并登录 Trae IDE）
+uv run python -m codebuddy_proxy --desensitize --trae
+```
+
+- **原理**：自动解密 Trae IDE 本地存储的 tc 加密登录态（AES-128-CBC + SHA-512），
+  或从 `.env` 读 `TRAE_TOKEN` / `TRAE_USER_ID`，直连 `trae-api-cn.mchost.guru`
+- **模型**：T1-T5 分级（glm-5.2 / qwen-3.7-plus / kimi-k2.6 / DeepSeek-V4-Pro 等），
+  支持外部名别名（如 `claude-sonnet-4-5` → `glm-5.2`）
+- **依赖**：纯 Python 标准库（含零依赖 AES 兜底实现），不需要 Node.js
+- **注意**：免费账号有日/周调用额度，耗尽时报 `4011`（今日用量已达上限），
+  错误会以友好中文文案透传
+
+#### Trae 账号工具（`trae-cli`）
+
+安装后（`uv sync` / `pip install .`）自带 `trae-cli` 命令，可查询/领取签到积分、查看权益、测试对话：
+
+```bash
+uv run trae-cli status            # 签到/积分状态（剩余积分、今日是否已签到）
+uv run trae-cli claim             # 领取今日签到积分
+uv run trae-cli usage             # 权益/用量（总额、已用比例、权益包列表）
+uv run trae-cli chat -m glm-5.2 -q "你好"    # 发一条对话测试
+```
+
+认证自动加载：优先 Work 凭证 `~/.ethan/trae_work.json`（`trae_work_login.py` 登录生成），
+其次解密本机 Trae IDE `storage.json`，无需手动配置 token。
 
 ### 用 `proxy.sh` 后台管理（推荐）
 
@@ -228,6 +276,48 @@ providers:
 | POST | `/v1/messages`        | Anthropic Messages（Claude Code） |
 
 端点使用本地 session 认证，无需额外 token。
+
+---
+
+## Provider 接口一览
+
+三种 provider 统一注册到 `providers.py` 的抽象层，`forward_chat` 按模型名路由。
+
+### 1. CodeBuddy Provider（`codebuddy_provider.py`）
+
+| 接口 | 说明 |
+| --- | --- |
+| `GET /v1/models` | 模型列表（静态 `models_config.json` / 本地配置 / 远程动态） |
+| `POST /v1/chat/completions` | OpenAI 对话（`stream_upstream` 流式 / `collect_upstream` 非流式） |
+| `POST /v1/responses` | Codex CLI Responses 协议适配 |
+| `POST /v1/messages` | Claude Code Anthropic Messages 协议适配 |
+| `forward_chat(body, "openai"/"codex"/"anthropic")` | 按协议转换 + 按模型路由到对应 provider |
+| session / 多账号 | 隔离的 session 文件，`--session-file` 指定 |
+
+### 2. 豆包 Provider（`doubao_provider.py` + `doubao/cdp_client.py`）
+
+| 接口 | 说明 |
+| --- | --- |
+| `CDPDoubaoClient.start()` | 确保 CDP：优先复用主 App（`open -a DoubaoWork --args --remote-debugging-port=9223`，不杀进程），兜底独立 Helper |
+| `CDPDoubaoClient.chat_completion()` | 页面内 fetch `/chat/completion`（自动带 a_bogus 签名），流式 yield SSE |
+| `DoubaoProvider.forward()` | 流式 / 非流式转换，返回 OpenAI 标准格式 |
+| 模型 | `doubao`（快速）/ `doubao-pro` / `doubao-think`（深度思考）/ `doubao-expert`（专家） |
+| 依赖 | 纯 Python 标准库，无 Playwright / chromium |
+
+### 3. Trae Provider（`trae_provider.py` + `trae_work_login*.py`）
+
+| 类别 | 接口 | 说明 |
+| --- | --- | --- |
+| 认证 | `decrypt_auth_data()` / `find_auth_data()` | 解密 Trae IDE 本地 `storage.json`（AES-128-CBC + SHA-512 派生） |
+| 认证 | `trae_work_login.py` / `trae_work_login_server.py` | Work 登录（ExchangeToken 换 token，回调自动捕获，落盘 `~/.ethan/trae_work.json`） |
+| 认证 | `_auth()` / `_load_work_cred()` | 凭证加载：`.env` → Work 凭证 → 本地解密 |
+| Chat | `send_trae_chat()` | IDE 通道（3 级端点回退） |
+| Chat | `_send_trae_work_chat()` | **Work 通道**（`function=solo_work_lite` + `config_name`，已验证返回真实回复） |
+| 签到 | `fetch_checkin_status()` | 查询签到/积分状态（`/trae/api/v2/ug/checkin_credits/status`） |
+| 签到 | `claim_checkin_credits()` | 领取签到积分（`/trae/api/v2/ug/checkin_credits/claim`） |
+| 权益 | `ide_user_ent_usage` 端点 | 查询积分总额 / 已用量 / 权益包 |
+| 模型 | `_map_model()` | T1-T5 分级 + 外部名别名（`claude-sonnet-4-5` → `glm-5.2`） |
+| 错误 | `_trae_error_text()` | 14+ 个官方错误码 → 中文文案（4011 今日额度 / 1005 plan 权益不足等） |
 
 ## 免责声明
 
