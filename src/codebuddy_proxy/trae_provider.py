@@ -397,6 +397,20 @@ def _map_model(requested: str) -> str:
     return MODEL_MAP.get(requested, requested)
 
 
+def _debug_dump(event: str, **kwargs: Any) -> None:
+    """WB_DEBUG_DUMP=1 时把调试事件写进 jsonl 日志（完整请求/响应/路由决策）。
+
+    惰性 import state 避免模块级循环依赖；失败静默（调试设施不能影响主流程）。
+    """
+    if not os.environ.get("WB_DEBUG_DUMP"):
+        return
+    try:
+        from .state import get_state
+        get_state().write_log(event, **kwargs)
+    except Exception:
+        pass
+
+
 # 注入的 agent 协议压制指令（见 _extract_prompt 说明）
 _AGENT_GUARD = (
     "当前环境是纯文本对话 API，没有任何命令执行、文件读写等工具，也没有 shell。"
@@ -460,19 +474,19 @@ def _sanitize_agent_leak(text: str) -> str:
 _LEAK_TAG_NAMES = ("tool_action", "tool_name", "tool_call", "think", "command")
 
 
-def _stream_hold_pos(buf: str) -> int:
+def _stream_hold_pos(buf: str, tags: tuple[str, ...] = _LEAK_TAG_NAMES) -> int:
     """返回应扣留的起始位置（-1 表示整段可安全释放）。
 
     两种扣留场景：
-    1. 存在未闭合的泄漏标签开启（如 <tool_action> 还没等到 </tool_action>）
-       ——必须等闭合标签到齐后整块清洗，否则会出现"剥了外壳留下内脏"
+    1. 存在未闭合的标签开启（如 <tool_action> 还没等到 </tool_action>）
+       ——必须等闭合标签到齐后整块处理，否则会出现"剥了外壳留下内脏"
        的残骸（下游收到的正是这种，解析器不认）
-    2. 尾部的裸 "<" 是某个泄漏标签名的前缀（如 "<tool_ac"）——扣住防止
+    2. 尾部的裸 "<" 是某个标签名的前缀（如 "<tool_ac"）——扣住防止
        标签名被 SSE 分包分裂
     """
     low = buf.lower()
     best = -1
-    for tag in _LEAK_TAG_NAMES:
+    for tag in tags:
         start = 0
         opener = f"<{tag}"
         while True:
@@ -520,6 +534,62 @@ class _StreamLeakCleaner:
         self._buf = ""
         return out
 
+# 工具调用流式标签（教学格式 + Trae 原生格式的标签名）
+_TOOL_STREAM_TAGS = ("tool_call", "tool_action", "tool_name", "command")
+
+
+class _StreamToolCallSplitter:
+    """流式工具调用切分器：正文按 chunk 透传，工具调用块整段扣留。
+
+    调用块（无论是否已闭合）都要在 flush 时统一解析成 OpenAI tool_calls，
+    不能当正文放行——所以从首个疑似标签起全部扣留（与泄漏清洗器的
+    "闭合即放行"语义不同）。
+    """
+
+    def __init__(self) -> None:
+        self._buf = ""
+
+    @staticmethod
+    def _first_tag_pos(buf: str) -> int:
+        low = buf.lower()
+        best = -1
+        for tag in _TOOL_STREAM_TAGS:
+            start = 0
+            opener = "<" + tag
+            while True:
+                i = low.find(opener, start)
+                if i == -1:
+                    break
+                after = low[i + len(opener): i + len(opener) + 1]
+                if after in ("", ">", "/", " ", "\t", "\n"):
+                    if best == -1 or i < best:
+                        best = i
+                    break
+                start = i + 1
+        if best != -1:
+            return best
+        # 尾部裸 "<" 可能是分裂的标签名前缀，扣住防漏
+        j = buf.rfind("<")
+        if j != -1 and ">" not in buf[j:]:
+            partial = buf[j + 1:].lower().lstrip("/")
+            if any(t.startswith(partial) for t in _TOOL_STREAM_TAGS):
+                return j
+        return -1
+
+    def feed(self, text: str) -> str:
+        self._buf += text
+        pos = self._first_tag_pos(self._buf)
+        if pos == -1:
+            safe, self._buf = self._buf, ""
+        else:
+            safe, self._buf = self._buf[:pos], self._buf[pos:]
+        return safe
+
+    def flush(self) -> tuple[str, list[dict[str, Any]]]:
+        rest, calls = _parse_tool_calls(self._buf)
+        self._buf = ""
+        return rest, calls
+
 
 def _looks_like_agent_request(messages: list[dict[str, Any]], body: dict[str, Any]) -> bool:
     """判断请求是否来自自带工具协议的下游（coding agent / function calling）。
@@ -564,7 +634,137 @@ def _looks_like_agent_request(messages: list[dict[str, Any]], body: dict[str, An
     return False
 
 
-def _extract_prompt(messages: list[dict[str, Any]], guard: bool = True) -> list[dict[str, Any]]:
+# prompt-based function calling 的教学格式标签。选 XML 标签 + JSON 参数：
+# 标签与模型原生 SOLO 协议同构（遵循度最高），JSON 参数适配任意工具 schema
+_TC_OPEN = '<tool_call>'
+_TC_CLOSE = '</tool_call>'
+_TOOL_DECODER = json.JSONDecoder()
+
+
+def _build_tools_system(tools: list[dict[str, Any]]) -> str:
+    """把 OpenAI tools 定义序列化成 prompt-based function calling 教学指令。
+
+    Trae 上游不支持原生 tools 参数，用提示词教学 + 输出解析的方式模拟。
+    """
+    defs = []
+    for t in tools:
+        f = t.get("function") if isinstance(t, dict) else None
+        if not isinstance(f, dict) or not f.get("name"):
+            continue
+        defs.append({
+            "name": f.get("name", ""),
+            "description": f.get("description", ""),
+            "parameters": f.get("parameters", {}),
+        })
+    if not defs:
+        return ""
+    return (
+        "你可以调用下列工具（function calling）。工具列表：\n"
+        + json.dumps(defs, ensure_ascii=False)
+        + "\n\n调用规则：\n"
+        "- 需要调用工具时，输出如下格式的调用块（JSON 一行，可连续多个块）：\n"
+        + _TC_OPEN + '\n{"name": "工具名", "arguments": {参数对象}}\n' + _TC_CLOSE + "\n"
+        "- arguments 必须是合法 JSON 对象，与工具参数 schema 一致。\n"
+        "- 调用块外可以写简短的说明文字；不要把工具参数写进正文；"
+        "不要发明列表外的工具。\n"
+        "- 收到 [tool_result] 开头的消息后，那是工具执行结果，据此继续任务，"
+        "直到可以给出最终回答。"
+    )
+
+
+def _serialize_tool_calls(tool_calls: list[dict[str, Any]]) -> str:
+    """把历史 assistant.tool_calls 序列化成教学格式的调用块文本。"""
+    parts = []
+    for c in tool_calls:
+        f = c.get("function") or {}
+        try:
+            args = json.loads(f.get("arguments") or "{}")
+        except Exception:
+            args = {"raw": f.get("arguments", "")}
+        parts.append(_TC_OPEN + "\n" + json.dumps(
+            {"name": f.get("name", ""), "arguments": args}, ensure_ascii=False
+        ) + "\n" + _TC_CLOSE)
+    return "\n".join(parts)
+
+
+def _mk_tool_call(idx: int, name: str, arguments: str) -> dict[str, Any]:
+    return {
+        "id": f"call_{idx:02d}_{uuid.uuid4().hex[:20]}",
+        "type": "function",
+        "function": {"name": name, "arguments": arguments},
+    }
+
+
+def _parse_tool_calls(content: str) -> tuple[str, list[dict[str, Any]]]:
+    """从模型输出里解析工具调用块，返回 (剩余正文, tool_calls 列表)。
+
+    主路径解析教学格式（JSON 参数，用 raw_decode 正确处理嵌套大括号）；
+    兜底解析 Trae 原生 SOLO XML（<tool_name>/<command>，名字对不上由
+    下游 agent 报错纠偏）。
+    """
+    calls: list[dict[str, Any]] = []
+    rest_parts: list[str] = []
+    pos = 0
+    n = len(content)
+    while pos < n:
+        i = content.find(_TC_OPEN, pos)
+        if i == -1:
+            rest_parts.append(content[pos:])
+            break
+        rest_parts.append(content[pos:i])
+        j = i + len(_TC_OPEN)
+        while j < n and content[j] in " \t\r\n":
+            j += 1
+        obj = None
+        end = -1
+        if j < n and content[j] == "{":
+            try:
+                obj, end = _TOOL_DECODER.raw_decode(content, j)
+            except ValueError:
+                obj = None
+        if obj is not None:
+            k = end
+            while k < n and content[k] in " \t\r\n":
+                k += 1
+            if content.startswith(_TC_CLOSE, k):
+                name = obj.get("name") or obj.get("tool") or ""
+                args = obj.get("arguments", obj.get("args", {}))
+                if not isinstance(args, dict):
+                    args = {"input": args}
+                if name:
+                    calls.append(_mk_tool_call(
+                        len(calls), str(name), json.dumps(args, ensure_ascii=False)))
+                    pos = k + len(_TC_CLOSE)
+                    continue
+        # 不是合法调用块：保留原文继续扫描
+        rest_parts.append(content[i:i + len(_TC_OPEN)])
+        pos = i + len(_TC_OPEN)
+    rest = "".join(rest_parts)
+
+    # 兜底：Trae 原生 <tool_name>/<command>（仅当教学格式没解析出任何调用时）
+    if not calls:
+        def _grab_native(match: re.Match) -> str:
+            calls.append(_mk_tool_call(len(calls), match.group(1), json.dumps(
+                {"command": match.group(2).strip()}, ensure_ascii=False)))
+            return ""
+
+        native_re = re.compile(
+            r"<tool_name>\s*([^<\s]+)\s*</tool_name>\s*<command>\s*([\s\S]*?)\s*</command>",
+            re.S,
+        )
+        rest = native_re.sub(_grab_native, rest)
+        rest = re.sub(r"</?tool_action[^>]*>", "", rest)
+        rest = re.sub(re.escape(_TC_OPEN) + r"\s*", "", rest)
+        rest = re.sub(r"\s*" + re.escape(_TC_CLOSE), "", rest)
+
+    return rest.strip(), calls
+
+
+def _extract_prompt(
+    messages: list[dict[str, Any]],
+    guard: bool = True,
+    tools: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """OpenAI messages -> Trae messages（content 转成 block 数组）。
 
     纯对话请求（guard=True）注入 agent 协议压制指令：Trae 的 llm_utils_chat
@@ -574,9 +774,18 @@ def _extract_prompt(messages: list[dict[str, Any]], guard: bool = True) -> list[
 
     coding agent 请求（guard=False，由 _looks_like_agent_request 判定）不注入：
     下游 system prompt 自己教的工具格式模型会完美遵循，注入反而制造指令冲突。
+
+    带 tools 的请求（prompt-based function calling shim）：
+    - 工具教学指令追加到首条 system（没有则新建）
+    - 历史 assistant.tool_calls 序列化成调用块文本（上游是纯 chat 模型，
+      不认 tool_calls 字段，丢了模型就不知道自己之前调过什么）
+    - role=tool 的结果消息转成 user 角色 + [tool_result] 前缀
     """
     out: list[dict[str, Any]] = []
     guard_merged = False
+    tools_taught = False
+    teaching = _build_tools_system(tools) if tools else ""
+
     for m in messages:
         role = m.get("role", "user")
         content = m.get("content", "")
@@ -589,19 +798,43 @@ def _extract_prompt(messages: list[dict[str, Any]], guard: bool = True) -> list[
             )
         else:
             text = ""
-        if guard and role == "system" and not guard_merged:
-            # 合并进调用方自己的 system 消息，保持单条 system
-            out.append({
-                "role": "system",
-                "content": [{"type": "text", "text": _AGENT_GUARD + "\n\n" + text}],
-            })
+
+        tool_calls = m.get("tool_calls") if isinstance(m, dict) else None
+        if role == "assistant" and tool_calls:
+            # 上游不认 tool_calls 字段：序列化成教学格式的调用块拼进正文
+            if text:
+                text = text + "\n" + _serialize_tool_calls(tool_calls)
+            else:
+                text = _serialize_tool_calls(tool_calls)
+        elif role in ("tool", "function"):
+            # 工具结果消息：转 user 角色 + [tool_result] 前缀（上游无此角色概念）
+            name = m.get("name") or (
+                (m.get("tool_call_id") and "") or "tool"
+            )
+            text = f"[tool_result | {name}]\n{text}"
+            role = "user"
+
+        if role == "system" and not guard_merged:
+            merged = text
+            if guard:
+                merged = _AGENT_GUARD + "\n\n" + merged
+            if teaching and not tools_taught:
+                merged = merged + "\n\n" + teaching
+                tools_taught = True
+            out.append({"role": "system", "content": [{"type": "text", "text": merged}]})
             guard_merged = True
             continue
         out.append({"role": role, "content": [{"type": "text", "text": text}]})
+
     if guard and not guard_merged:
         out.insert(0, {
             "role": "system",
             "content": [{"type": "text", "text": _AGENT_GUARD}],
+        })
+    if teaching and not tools_taught:
+        out.insert(0, {
+            "role": "system",
+            "content": [{"type": "text", "text": teaching}],
         })
     return out
 
@@ -721,7 +954,14 @@ def _send_trae_work_chat(
     )
     try:
         with urllib.request.urlopen(req, timeout=180) as resp:
-            return resp.read().decode("utf-8", errors="replace")
+            raw = resp.read().decode("utf-8", errors="replace")
+            _debug_dump(
+                "debug_trae_upstream",
+                model=trae_model,
+                function=body["function"],
+                raw=raw[:20000],
+            )
+            return raw
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")[:500]
         raise HTTPException(status_code=502, detail=f"trae work chat failed: {e.code} {detail}")
@@ -896,26 +1136,39 @@ class TraeProvider(BaseProvider):
         stream = bool(body.get("stream", False))
         # coding agent 请求：不注入 guard、不清洗——下游自己解析工具调用语法
         agent_mode = _looks_like_agent_request(messages, body)
+        _debug_dump(
+            "debug_trae_route",
+            model=requested_model,
+            agent_mode=agent_mode,
+            tools_count=len(body.get("tools") or []),
+            stream=stream,
+            message_count=len(messages),
+        )
 
-        prompt = _extract_prompt(messages, guard=not agent_mode)
+        tools = body.get("tools") or []
+        prompt = _extract_prompt(
+            messages, guard=not agent_mode, tools=tools if agent_mode else None
+        )
         if not prompt:
             raise HTTPException(status_code=400, detail="no text content")
 
         if stream:
             return StreamingResponse(
-                self._stream(prompt, requested_model, sanitize=not agent_mode),
+                self._stream(prompt, requested_model,
+                             sanitize=not agent_mode, tools=tools or None),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "Connection": "close"},
             )
         # 非流式聚合内部是同步 urllib 调用（最长 180s），放线程池执行，
         # 避免阻塞事件循环拖垮所有并发请求
         collected = await asyncio.to_thread(
-            self._collect, prompt, requested_model, not agent_mode
+            self._collect, prompt, requested_model, not agent_mode, tools or None
         )
         return JSONResponse(content=collected)
 
     def _stream(
-        self, messages: list[dict[str, Any]], model: str, sanitize: bool = True
+        self, messages: list[dict[str, Any]], model: str, sanitize: bool = True,
+        tools: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[str]:
         """把 Trae SSE 转成 OpenAI chat.completion.chunk 流。"""
         request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
@@ -935,6 +1188,8 @@ class TraeProvider(BaseProvider):
         try:
             raw = send_trae_chat(messages, model, stream=True, base_url=self._base_url)
             cleaner = _StreamLeakCleaner() if sanitize else None
+            splitter = _StreamToolCallSplitter() if tools else None
+            dbg_parts: list[str] = []
             for event, data in _parse_sse(raw):
                 if event == "error":
                     msg = _trae_error_text(data)
@@ -949,7 +1204,10 @@ class TraeProvider(BaseProvider):
                         text = data["response"]
                         if cleaner is not None:
                             text = cleaner.feed(text)
+                        elif splitter is not None:
+                            text = splitter.feed(text)
                         if text:
+                            dbg_parts.append(text)
                             yield chunk({"role": "assistant", "content": text})
                             in_thinking = False
                 elif event == "done":
@@ -963,15 +1221,28 @@ class TraeProvider(BaseProvider):
             yield chunk({"content": f"[Error: {e}]"})
             return
 
+        finish = "stop"
         if cleaner is not None:
             tail = cleaner.flush()
             if tail:
+                dbg_parts.append(tail)
                 yield chunk({"role": "assistant", "content": tail})
-        yield chunk({}, "stop")
+        elif splitter is not None:
+            tail, calls = splitter.flush()
+            if tail:
+                dbg_parts.append(tail)
+                yield chunk({"role": "assistant", "content": tail})
+            if calls:
+                finish = "tool_calls"
+                yield chunk({"tool_calls": calls})
+        _debug_dump("debug_trae_response", model=model, stream=True,
+                    content="".join(dbg_parts))
+        yield chunk({}, finish)
         yield "data: [DONE]\n\n"
 
     def _collect(
-        self, messages: list[dict[str, Any]], model: str, sanitize: bool = True
+        self, messages: list[dict[str, Any]], model: str, sanitize: bool = True,
+        tools: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """非流式：聚合 Trae SSE 成完整响应。"""
         reasoning_parts: list[str] = []
@@ -994,6 +1265,11 @@ class TraeProvider(BaseProvider):
         content = "".join(content_parts)
         if sanitize:
             content = _sanitize_agent_leak(content)
+        tool_calls: list[dict[str, Any]] = []
+        if tools:
+            content, tool_calls = _parse_tool_calls(content)
+        _debug_dump("debug_trae_response", model=model, stream=False, content=content,
+                    tool_calls=len(tool_calls))
         if not content and not reasoning:
             content = "(trae upstream 返回了空响应，未产生任何内容)"
         if reasoning:
@@ -1010,8 +1286,12 @@ class TraeProvider(BaseProvider):
             "model": model,
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": content},
-                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                    **({"tool_calls": tool_calls} if tool_calls else {}),
+                },
+                "finish_reason": "tool_calls" if tool_calls else "stop",
             }],
             "usage": {
                 "prompt_tokens": 0,

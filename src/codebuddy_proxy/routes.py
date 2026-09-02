@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from typing import Any
 
@@ -176,6 +177,11 @@ async def chat_completions(request: Request):
 
     log_client_request("POST", "/v1/chat/completions", body)
     diagnostic("request", protocol="openai", **body_summary(body))
+
+    # 调试抓包：WB_DEBUG_DUMP=1 时落完整请求体（含 messages 全文、tools），
+    # 用于排查下游 agent 的协议细节（默认关闭，不影响生产日志）
+    if os.environ.get("WB_DEBUG_DUMP"):
+        state.write_log("debug_full_request", body=body)
 
     return await forward_chat(body, "openai")
 
