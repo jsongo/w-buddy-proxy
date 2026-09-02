@@ -46,9 +46,11 @@ IDE_VERSION = "3.3.67"
 IDE_VERSION_CODE = "20260401"
 X_APP_ID = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
 
-# Trae Work (SOLO) 客户端版本（traework2api 实测值，Work 与 IDE 版本不同）
-_TRAE_APP_VERSION = "0.1.43"
-_TRAE_APP_VERSION_CODE = "20260716"
+# Trae Work (SOLO) 客户端版本。
+# 注意：服务端按版本号 gating 新模型——旧版本（0.1.43/20260716）请求 glm-5.3
+# 等新模型会被拒为 4001 "param is invalid"；升级后才返回真实路由（实测）。
+_TRAE_APP_VERSION = "0.2.0"
+_TRAE_APP_VERSION_CODE = "20260901"
 
 # 3 级端点回退（与 trae-local-api 一致）
 ENDPOINTS = [
@@ -57,32 +59,56 @@ ENDPOINTS = [
     "/api/agent/v3/create_agent_task",
 ]
 
-# 模型名映射：外部名 -> Trae 内部名（与 trae-local-api 一致）
+# 模型名映射：外部别名 -> Trae 内部 config_name（大小写敏感，须与下方实测白名单一致）
 MODEL_MAP: dict[str, str] = {
-    "claude-opus-4-7": "glm-5.2",
-    "claude-opus-4-6": "glm-5.2",
-    "claude-opus-4-5": "glm-5.2",
-    "claude-sonnet-4-6": "glm-5.2",
-    "claude-sonnet-4-5": "glm-5.2",
-    "claude-sonnet-4": "glm-5.2",
-    "claude-3.5-sonnet": "glm-5.2",
-    "claude-3.7-sonnet": "glm-5.2",
-    "claude-haiku-4-5": "glm-5.1",
-    "mimo-v2.5-pro": "glm-5.2",
-    "mimo-v2.5": "glm-5.2",
+    "claude-opus-4-7": "glm-5.3",
+    "claude-opus-4-6": "glm-5.3",
+    "claude-opus-4-5": "glm-5.3",
+    "claude-sonnet-4-6": "glm-5.3",
+    "claude-sonnet-4-5": "glm-5.3",
+    "claude-sonnet-4": "glm-5.3",
+    "claude-3.5-sonnet": "glm-5.3",
+    "claude-3.7-sonnet": "glm-5.3",
+    "claude-haiku-4-5": "DeepSeek-V4-Flash",
+    "mimo-v2.5-pro": "glm-5.3",
+    "mimo-v2.5": "glm-5.3",
     "gpt-4o": "DeepSeek-V4-Pro",
     "gpt-4o-mini": "DeepSeek-V4-Flash",
     "gpt-4.1": "DeepSeek-V4-Pro",
-    "auto": "glm-5.2",
+    "auto": "glm-5.3",
+    # 大小写容错：Trae config_name 大小写不统一（DeepSeek-/Doubao- 为大写前缀），
+    # 而 OpenAI 生态习惯全小写；小写请求若不在此映射，会落回默认 CodeBuddy 通道
+    # （报错表现为 CodeBuddy 上游的安全审核/路由错误，而非 Trae 响应）
+    "deepseek-v4-pro": "DeepSeek-V4-Pro",
+    "deepseek-v4-flash": "DeepSeek-V4-Flash",
+    "doubao-seed-evolving": "Doubao-Seed-Evolving",
+    "doubao-seed-2.1-pro": "Doubao-Seed-2.1-Pro",
+    "doubao-seed-2.1-turbo": "Doubao-Seed-2.1-Turbo",
+    "doubao-seed-code": "Doubao-Seed-Code",
+    # qwen 官方命名点号/连字符混用，两种写法都放行
+    "qwen-3.8-max": "qwen3.8-max",
+    "qwen3.7-plus": "qwen-3.7-plus",
 }
 
-# 模型分级（T1 最强 -> T5 最弱）
+# 模型分级（T1 最强 -> T4 最弱）。
+# config_name 全部为 2026-09 实测通过值（Work 凭证 + llm_utils_chat 端点）：
+# 注意命名大小写不统一——DeepSeek-/Doubao- 为大写前缀，glm/kimi/minimax 小写，
+# qwen 两种写法并存（qwen3.8-max 用点号、qwen-3.7-plus 用连字符）。
+# kimi-k3 虽在官方文档内，但需会员 Pro+/Ultra/Express（免费账号 1005），故不列出。
 MODEL_TIERS: dict[str, list[str]] = {
-    "T1": ["glm-5.2"],
-    "T2": ["glm-5.1", "qwen-3.7-plus", "kimi-k2.6", "DeepSeek-V4-Pro"],
-    "T3": ["glm-5", "qwen-3.6-plus", "minimax-m3", "DeepSeek-V4-Flash"],
-    "T4": ["glm-4.7", "kimi-k2", "qwen3-coder", "minimax-m2.7"],
-    "T5": ["glm-4.6", "minimax-m2.1"],
+    "T1": ["glm-5.3", "Doubao-Seed-Evolving"],
+    "T2": ["glm-5.2", "Doubao-Seed-2.1-Pro", "DeepSeek-V4-Pro",
+           "kimi-k2.7-code", "qwen3.8-max"],
+    "T3": ["Doubao-Seed-2.1-Turbo", "DeepSeek-V4-Flash", "minimax-m3",
+           "kimi-k2.6", "glm-5.1"],
+    "T4": ["Doubao-Seed-Code", "glm-5", "glm-5-turbo", "qwen-3.7-plus"],
+}
+
+# 部分模型在 solo_work_lite function 下不可用（服务端 4001），需改用 chat_v3。
+# 实测：glm-5.1 / Doubao-Seed-Code 仅在 chat_v3 下可路由。
+_WORK_FUNCTION_OVERRIDE: dict[str, str] = {
+    "glm-5.1": "chat_v3",
+    "Doubao-Seed-Code": "chat_v3",
 }
 
 
@@ -467,7 +493,9 @@ def _send_trae_work_chat(
 
     trae_model = _map_model(model)
     body = _build_chat_body(messages, trae_model, stream)
-    body["function"] = "solo_work_lite"
+    # 绝大多数模型走 solo_work_lite；少数（glm-5.1 / Doubao-Seed-Code 等）
+    # 在该 function 下 4001，需改走 chat_v3（实测）
+    body["function"] = _WORK_FUNCTION_OVERRIDE.get(trae_model, "solo_work_lite")
 
     machine_id = work.get("machine_id") or uuid.uuid4().hex
     device_id = work.get("device_id") or hashlib.sha256(machine_id.encode()).hexdigest()[:32]
@@ -512,7 +540,8 @@ def _send_trae_work_chat(
 
 # 全局认证缓存（惰性加载）
 _auth_cache: tuple[str, str] | None = None
-_WORK_CRED_PATH = Path.home() / ".ethan" / "trae_work.json"
+# 凭证路径可用 TRAE_WORK_CRED_PATH 覆盖（默认寄存在 ~/.ethan，兼容 ethan 生态）
+_WORK_CRED_PATH = Path(os.environ.get("TRAE_WORK_CRED_PATH", str(Path.home() / ".ethan" / "trae_work.json")))
 
 
 def _load_work_cred() -> dict[str, Any] | None:

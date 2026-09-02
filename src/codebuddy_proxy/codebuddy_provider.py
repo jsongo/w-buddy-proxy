@@ -172,8 +172,12 @@ async def forward_chat(
 ) -> StreamingResponse | JSONResponse:
     """转发 chat 请求到上游，支持流式和非流式。
 
-    多 provider 路由：若请求模型命中某个非默认 provider（如豆包），
-    走该 provider 的 forward；否则走默认 CodeBuddy。
+    多 provider 路由（两种方式）：
+    1. 显式前缀：``model: "<provider-id>/<model-name>"``，如
+       ``trae/DeepSeek-V4-Flash``、``doubao/doubao-think``；前缀命中已启用
+       的 provider 时，剥掉前缀再转发（前缀不匹配则把整串当普通模型名）。
+    2. 自动匹配：模型 id 命中某个非默认 provider 的 models() 列表
+       （如豆包/Trae 模型），走该 provider 的 forward；否则走默认 CodeBuddy。
     """
     state = get_state()
 
@@ -181,10 +185,23 @@ async def forward_chat(
     requested_model = body.get("model")
     providers = getattr(state, "providers", {}) or {}
     provider = None
-    for p in providers.values():
-        if any(m.get("id") == requested_model for m in p.models()):
-            provider = p
-            break
+
+    # 1) 显式 provider 前缀：provider/model
+    if isinstance(requested_model, str) and "/" in requested_model:
+        prefix, real_model = requested_model.split("/", 1)
+        if prefix in providers:
+            provider = providers[prefix]
+            # 剥掉前缀后再转发（上游不认识 "trae/" 前缀）
+            body = {**body, "model": real_model}
+            requested_model = real_model
+
+    # 2) 自动匹配模型 id
+    if provider is None:
+        for p in providers.values():
+            if any(m.get("id") == requested_model for m in p.models()):
+                provider = p
+                break
+
     if provider is not None:
         # 非默认 provider（豆包等）：仅 openai 协议透传（doubao2api 只支持
         # OpenAI chat completions；responses/anthropic 协议由调用方决定，
