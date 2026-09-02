@@ -218,6 +218,24 @@ class CDPDoubaoClient:
         ws_url = chat["webSocketDebuggerUrl"]
         path = ws_url.split(f":{self.port}", 1)[1]
         self._ws = _WS("127.0.0.1", self.port, path)
+
+        # 连到的可能只是 Helper 的 chrome:// 占位页（如
+        # chrome://doubaowork-chat/cross-site-support/，无 bdms/cookie，
+        # 直接发请求会报 710020202 invalid param）—— 主动导航到聊天页。
+        href = await asyncio.to_thread(self._evaluate, "location.href")
+        if "doubao.com" not in (href or ""):
+            log.info("CDPDoubaoClient: target is %s, navigating to chat page", href)
+            with self._ws_lock:
+                self._ws.cmd("Page.navigate", {"url": "https://www.doubao.com/chat/"})
+            # 等导航完成（readyState=complete 且已到豆包域名）
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                href = await asyncio.to_thread(self._evaluate, "location.href")
+                rs = await asyncio.to_thread(self._evaluate, "document.readyState")
+                if "doubao.com" in (href or "") and rs == "complete":
+                    break
+                await asyncio.sleep(0.5)
+
         await self._wait_for_bdms()
         self._web_id = await self._extract_web_id() or ""
         self._ready = True
@@ -335,13 +353,28 @@ class CDPDoubaoClient:
             return []
 
     async def _wait_for_target(self, timeout: float = 60.0) -> dict[str, Any] | None:
+        """找可用的 chat target。
+
+        优先豆包域名页面（主 App 复用场景下已存在）；独立 Helper 只开
+        chrome://doubaowork-chat/... 占位页（URL 含 "chat" 会误匹配旧逻辑），
+        等一小段宽限期后返回该占位页，由 _connect_chat 导航到聊天页。
+        """
         deadline = time.time() + timeout
+        grace = time.time() + 5  # 最多等 5s 让豆包域名页面出现
+        fallback: dict[str, Any] | None = None
         while time.time() < deadline:
             for t in await asyncio.to_thread(self._fetch_targets):
-                if t.get("type") == "page" or "chat" in t.get("url", ""):
+                url = t.get("url", "")
+                if not t.get("webSocketDebuggerUrl"):
+                    continue
+                if "doubao.com" in url:
                     return t
-            await asyncio.sleep(0.2)
-        return None
+                if fallback is None and t.get("type") == "page":
+                    fallback = t
+            await asyncio.sleep(0.3)
+            if fallback is not None and time.time() > grace:
+                return fallback
+        return fallback
 
     async def _wait_for_bdms(self, timeout: float = 30.0) -> None:
         deadline = time.time() + timeout

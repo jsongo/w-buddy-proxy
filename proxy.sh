@@ -25,9 +25,9 @@ mkdir -p "$LOG_DIR"
 # 仅本机使用可显式指定：./proxy.sh start -H 127.0.0.1
 PROXY_HOST="${PROXY_HOST:-0.0.0.0}"
 PROXY_PORT="${PROXY_PORT:-8787}"
-# 默认启用 Trae 通道并作为兜底通道（未命中模型名时走 Trae）；
+# 默认启用 Trae（兜底通道）+ 豆包（CDP 直连）；
 # 可用 PROXY_EXTRA_ARGS 覆盖，或命令行追加参数（如 --default-provider codebuddy）
-EXTRA_ARGS="${PROXY_EXTRA_ARGS:---desensitize --trae --default-provider trae}"
+EXTRA_ARGS="${PROXY_EXTRA_ARGS:---desensitize --trae --doubao --default-provider trae}"
 
 # 优先使用项目自带 .venv（uv 已装好依赖），否则退回系统 python
 if [[ -x "$SCRIPT_DIR/.venv/bin/python" ]]; then
