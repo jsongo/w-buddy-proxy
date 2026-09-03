@@ -156,8 +156,11 @@ class DoubaoProvider(BaseProvider):
         bot_id = body.get("bot_id")
 
         if body.get("stream"):
+            include_usage = bool(
+                (body.get("stream_options") or {}).get("include_usage"))
             return StreamingResponse(
-                self._stream(prompt, use_deep_think, requested_model, conversation_id, bot_id),
+                self._stream(prompt, use_deep_think, requested_model,
+                             conversation_id, bot_id, include_usage),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "Connection": "close"},
             )
@@ -216,6 +219,7 @@ class DoubaoProvider(BaseProvider):
         model: str,
         conversation_id: str | None,
         bot_id: str | None,
+        include_usage: bool = False,
     ) -> AsyncIterator[str]:
         """把豆包原始 SSE 事件转成 OpenAI chat.completion.chunk 流。"""
         request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
@@ -317,6 +321,21 @@ class DoubaoProvider(BaseProvider):
         if result_conversation_id:
             final_delta["conversation_id"] = result_conversation_id
         yield f"data: {json.dumps(_chunk(final_delta, 'stop'), ensure_ascii=False)}\n\n"
+        if include_usage:
+            # OpenAI 流式协议：stream_options.include_usage 时补一个 usage-only
+            # 收尾 chunk（豆包 CDP 通道无 token 统计，返回零值），下游客户端靠
+            # 它判定流的 is_final，缺失会导致 tool_calls 丢失
+            payload = {
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+                },
+            }
+            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
 
     async def _collect(

@@ -1153,9 +1153,12 @@ class TraeProvider(BaseProvider):
             raise HTTPException(status_code=400, detail="no text content")
 
         if stream:
+            include_usage = bool(
+                (body.get("stream_options") or {}).get("include_usage"))
             return StreamingResponse(
                 self._stream(prompt, requested_model,
-                             sanitize=not agent_mode, tools=tools or None),
+                             sanitize=not agent_mode, tools=tools or None,
+                             include_usage=include_usage),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "Connection": "close"},
             )
@@ -1169,11 +1172,13 @@ class TraeProvider(BaseProvider):
     def _stream(
         self, messages: list[dict[str, Any]], model: str, sanitize: bool = True,
         tools: list[dict[str, Any]] | None = None,
+        include_usage: bool = False,
     ) -> AsyncIterator[str]:
         """把 Trae SSE 转成 OpenAI chat.completion.chunk 流。"""
         request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
         in_thinking = False
+        usage: dict[str, Any] | None = None
 
         def chunk(delta: dict[str, Any], finish: str | None = None) -> str:
             payload = {
@@ -1182,6 +1187,22 @@ class TraeProvider(BaseProvider):
                 "created": created,
                 "model": model,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+            }
+            return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+        def usage_chunk() -> str:
+            # OpenAI 流式协议：stream_options.include_usage 时，[DONE] 前须有一个
+            # choices 为空、只带 usage 的收尾 chunk。下游客户端（如 ethan）靠它
+            # 判定 is_final——缺失会导致 final chunk 永远不到、tool_calls 整体丢失
+            payload = {
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [],
+                "usage": usage or {
+                    "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+                },
             }
             return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
@@ -1210,6 +1231,16 @@ class TraeProvider(BaseProvider):
                             dbg_parts.append(text)
                             yield chunk({"role": "assistant", "content": text})
                             in_thinking = False
+                elif event == "token_usage":
+                    u = data or {}
+                    try:
+                        usage = {
+                            "prompt_tokens": int(u.get("prompt_tokens") or 0),
+                            "completion_tokens": int(u.get("completion_tokens") or 0),
+                            "total_tokens": int(u.get("total_tokens") or 0),
+                        }
+                    except (TypeError, ValueError):
+                        usage = None
                 elif event == "done":
                     break
         except HTTPException as e:
@@ -1222,6 +1253,7 @@ class TraeProvider(BaseProvider):
             return
 
         finish = "stop"
+        dbg_calls: list[dict[str, Any]] = []
         if cleaner is not None:
             tail = cleaner.flush()
             if tail:
@@ -1234,6 +1266,7 @@ class TraeProvider(BaseProvider):
                 yield chunk({"role": "assistant", "content": tail})
             if calls:
                 finish = "tool_calls"
+                dbg_calls = calls
                 # OpenAI 流式协议：tool_call 必须带 index（客户端靠它合并分片），
                 # 首个 delta 带 role；不带 index 会被部分解析器直接丢弃
                 yield chunk({"role": "assistant", "tool_calls": [
@@ -1242,8 +1275,15 @@ class TraeProvider(BaseProvider):
                     for i, c in enumerate(calls)
                 ]})
         _debug_dump("debug_trae_response", model=model, stream=True,
-                    content="".join(dbg_parts))
+                    content="".join(dbg_parts),
+                    tool_calls=[
+                        {"name": c["function"]["name"],
+                         "arguments": c["function"]["arguments"]}
+                        for c in dbg_calls
+                    ])
         yield chunk({}, finish)
+        if include_usage:
+            yield usage_chunk()
         yield "data: [DONE]\n\n"
 
     def _collect(
