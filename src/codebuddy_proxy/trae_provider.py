@@ -535,7 +535,7 @@ class _StreamLeakCleaner:
         return out
 
 # 工具调用流式标签（教学格式 + Trae 原生格式的标签名）
-_TOOL_STREAM_TAGS = ("tool_call", "tool_action", "tool_name", "command")
+_TOOL_STREAM_TAGS = ("tool_call", "tool_calls", "tool_action", "tool_name", "command")
 
 
 class _StreamToolCallSplitter:
@@ -702,6 +702,12 @@ def _parse_tool_calls(content: str) -> tuple[str, list[dict[str, Any]]]:
     兜底解析 Trae 原生 SOLO XML（<tool_name>/<command>，名字对不上由
     下游 agent 报错纠偏）。
     """
+    # 容错归一化：模型偶尔把标签写成复数变体（开/闭合都可能，大小写不定），
+    # 实测出现过「标准单数开标签 + 复数闭标签」的混搭——严格匹配会解析失败，
+    # 兜底清理只剥开标签、留下复数闭标签和裸 JSON 整段泄漏进正文。
+    # 先统一归一成教学的标准单数标签再进主解析。
+    content = re.sub(r"</\s*tool_calls\s*>", _TC_CLOSE, content, flags=re.I)
+    content = re.sub(r"<\s*tool_calls\s*>", _TC_OPEN, content, flags=re.I)
     calls: list[dict[str, Any]] = []
     rest_parts: list[str] = []
     pos = 0
@@ -713,29 +719,38 @@ def _parse_tool_calls(content: str) -> tuple[str, list[dict[str, Any]]]:
             break
         rest_parts.append(content[pos:i])
         j = i + len(_TC_OPEN)
-        while j < n and content[j] in " \t\r\n":
-            j += 1
-        obj = None
-        end = -1
-        if j < n and content[j] == "{":
-            try:
-                obj, end = _TOOL_DECODER.raw_decode(content, j)
-            except ValueError:
-                obj = None
-        if obj is not None:
-            k = end
-            while k < n and content[k] in " \t\r\n":
-                k += 1
-            if content.startswith(_TC_CLOSE, k):
+        block_calls: list[tuple[str, str]] = []
+        closed = False
+        # 块内循环：连续解码多个 JSON（复数容器装多个调用），直到闭标签
+        while True:
+            while j < n and content[j] in " \t\r\n":
+                j += 1
+            if j >= n:
+                break
+            if content.startswith(_TC_CLOSE, j):
+                j += len(_TC_CLOSE)
+                closed = True
+                break
+            if content[j] == "{":
+                try:
+                    obj, end = _TOOL_DECODER.raw_decode(content, j)
+                except ValueError:
+                    break
                 name = obj.get("name") or obj.get("tool") or ""
                 args = obj.get("arguments", obj.get("args", {}))
                 if not isinstance(args, dict):
                     args = {"input": args}
                 if name:
-                    calls.append(_mk_tool_call(
-                        len(calls), str(name), json.dumps(args, ensure_ascii=False)))
-                    pos = k + len(_TC_CLOSE)
-                    continue
+                    block_calls.append(
+                        (str(name), json.dumps(args, ensure_ascii=False)))
+                j = end
+                continue
+            break  # 既不是 JSON 也不是闭标签：块不合法
+        if closed and block_calls:
+            for name, args_json in block_calls:
+                calls.append(_mk_tool_call(len(calls), name, args_json))
+            pos = j
+            continue
         # 不是合法调用块：保留原文继续扫描
         rest_parts.append(content[i:i + len(_TC_OPEN)])
         pos = i + len(_TC_OPEN)
