@@ -62,21 +62,21 @@ ENDPOINTS = [
 
 # 模型名映射：外部别名 -> Trae 内部 config_name（大小写敏感，须与下方实测白名单一致）
 MODEL_MAP: dict[str, str] = {
-    "claude-opus-4-7": "glm-5.3",
-    "claude-opus-4-6": "glm-5.3",
-    "claude-opus-4-5": "glm-5.3",
-    "claude-sonnet-4-6": "glm-5.3",
-    "claude-sonnet-4-5": "glm-5.3",
-    "claude-sonnet-4": "glm-5.3",
-    "claude-3.5-sonnet": "glm-5.3",
-    "claude-3.7-sonnet": "glm-5.3",
-    "claude-haiku-4-5": "DeepSeek-V4-Flash",
-    "mimo-v2.5-pro": "glm-5.3",
-    "mimo-v2.5": "glm-5.3",
-    "gpt-4o": "DeepSeek-V4-Pro",
-    "gpt-4o-mini": "DeepSeek-V4-Flash",
-    "gpt-4.1": "DeepSeek-V4-Pro",
-    "auto": "glm-5.3",
+    # "claude-opus-4-7": "glm-5.3",
+    # "claude-opus-4-6": "glm-5.3",
+    # "claude-opus-4-5": "glm-5.3",
+    # "claude-sonnet-4-6": "glm-5.3",
+    # "claude-sonnet-4-5": "glm-5.3",
+    # "claude-sonnet-4": "glm-5.3",
+    # "claude-3.5-sonnet": "glm-5.3",
+    # "claude-3.7-sonnet": "glm-5.3",
+    # "claude-haiku-4-5": "DeepSeek-V4-Flash",
+    # "mimo-v2.5-pro": "glm-5.3",
+    # "mimo-v2.5": "glm-5.3",
+    # "gpt-4o": "DeepSeek-V4-Pro",
+    # "gpt-4o-mini": "DeepSeek-V4-Flash",
+    # "gpt-4.1": "DeepSeek-V4-Pro",
+    # "auto": "glm-5.3",
     # 大小写容错：Trae config_name 大小写不统一（DeepSeek-/Doubao- 为大写前缀），
     # 而 OpenAI 生态习惯全小写；小写请求若不在此映射，会落回默认 CodeBuddy 通道
     # （报错表现为 CodeBuddy 上游的安全审核/路由错误，而非 Trae 响应）
@@ -97,7 +97,7 @@ MODEL_MAP: dict[str, str] = {
 # qwen 两种写法并存（qwen3.8-max 用点号、qwen-3.7-plus 用连字符）。
 # kimi-k3 虽在官方文档内，但需会员 Pro+/Ultra/Express（免费账号 1005），故不列出。
 MODEL_TIERS: dict[str, list[str]] = {
-    "T1": ["glm-5.3", "Doubao-Seed-Evolving"],
+    "T1": ["glm-5.3", "glm-5.3-flash", "Doubao-Seed-Evolving"],
     "T2": ["glm-5.2", "Doubao-Seed-2.1-Pro", "DeepSeek-V4-Pro",
            "kimi-k2.7-code", "qwen3.8-max"],
     "T3": ["Doubao-Seed-2.1-Turbo", "DeepSeek-V4-Flash", "minimax-m3",
@@ -106,10 +106,13 @@ MODEL_TIERS: dict[str, list[str]] = {
 }
 
 # 部分模型在 solo_work_lite function 下不可用（服务端 4001），需改用 chat_v3。
-# 实测：glm-5.1 / Doubao-Seed-Code 仅在 chat_v3 下可路由。
+# 实测（2026-09-03）：glm-5.1 / Doubao-Seed-Code 仅在 chat_v3 下可路由；
+# glm-5.3-flash 同理——solo_work_lite 报 4001 "param is invalid"，
+# chat_v3 正常出流（会话 s_20260903_2108_4190 即踩此坑）。
 _WORK_FUNCTION_OVERRIDE: dict[str, str] = {
     "glm-5.1": "chat_v3",
     "Doubao-Seed-Code": "chat_v3",
+    "glm-5.3-flash": "chat_v3",
 }
 
 
@@ -1742,6 +1745,9 @@ class TraeProvider(BaseProvider):
 
         reasoning = "".join(reasoning_parts)
         content = "".join(content_parts)
+        # 无 tools 请求也必须有初始值——下方 _debug_dump 无条件引用
+        # （实测缺失时非流式无 tools 请求直接 UnboundLocalError -> internal error）
+        tool_calls: list[dict[str, Any]] = []
         # 顺序关键：带 tools 的请求必须先解析、后清洗——_sanitize_agent_leak
         # 会把 <tool_call>/</arg_value> 标签全剥掉，先清洗再解析会让解析器
         # 拿到被拆掉结构的残骸（实测 glm-5.3 函数调用表达式因此整段漏进正文）
