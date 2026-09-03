@@ -447,8 +447,16 @@ _LEAK_RE = [
     # think 块（reasoning 泄漏到正文）与孤立 think 标签
     re.compile(r"<think>.*?</think>", re.S),
     re.compile(r"</?\s*think>"),
+    # 伪回调头 <tool_callback>（deepseek-v4-flash 实测：开标签后跟意图文本、
+    # 不闭合也不携带调用，纯粹是协议噪音，整块剥离；未闭合时剥到流末尾）。
+    # 必须排在孤立 tool_call 模式之前——tool_call[^>]* 会把 <tool_callback>
+    # 误当孤儿 tool_call 标签先剥壳，导致块模式失配、内部文本泄漏
+    re.compile(r"<tool_callback[^>]*>.*?(?:</tool_callback>|\Z)", re.S),
+    re.compile(r"</?\s*tool_callback[^>]*>"),
     # 孤立 tool_call 标签
     re.compile(r"</?\s*tool_call[^>]*>"),
+    # 孤立 arg_key / arg_value 标签（工具调用残骸，glm-5.3 实测）
+    re.compile(r"</?\s*arg_(?:key|value)[^>]*>"),
     # 工具执行失败的提示行
     re.compile(r"执行过程发生错误[:：][^\n]*"),
 ]
@@ -462,7 +470,8 @@ def _sanitize_agent_leak(text: str) -> str:
     """
     if not any(k in text for k in (
         "Command", "tool_call", "tool_action", "tool_name",
-        "<command", "think", "执行过程发生错误",
+        "tool_callback", "<command", "arg_value", "arg_key",
+        "think", "执行过程发生错误",
     )):
         return text
     for pat in _LEAK_RE:
@@ -471,7 +480,7 @@ def _sanitize_agent_leak(text: str) -> str:
 
 
 # 泄漏标签名（流式扣留判断用；大小写不敏感）
-_LEAK_TAG_NAMES = ("tool_action", "tool_name", "tool_call", "think", "command")
+_LEAK_TAG_NAMES = ("tool_action", "tool_name", "tool_call", "tool_callback", "think", "command")
 
 
 def _stream_hold_pos(buf: str, tags: tuple[str, ...] = _LEAK_TAG_NAMES) -> int:
@@ -535,7 +544,10 @@ class _StreamLeakCleaner:
         return out
 
 # 工具调用流式标签（教学格式 + Trae 原生格式的标签名）
-_TOOL_STREAM_TAGS = ("tool_call", "tool_calls", "tool_action", "tool_name", "command")
+# tool_callback：deepseek-v4-flash 实测的伪回调头（开标签 + 意图文本、不闭合），
+# 不扣留的话会当正文流出（下游 UI 直接看到 <tool_callback>…）；扣留后交给
+# _parse_tool_calls 统一剥离
+_TOOL_STREAM_TAGS = ("tool_call", "tool_calls", "tool_action", "tool_name", "tool_callback", "command")
 
 # 裸 JSON 工具调用候选前缀：模型偶尔省略标签，直接在行首输出
 # {"name": ...} 或 [{"name": ...}]（数组包多个调用）
@@ -892,8 +904,41 @@ def _parse_tool_calls(
         pos = i + len(_TC_OPEN)
     rest = "".join(rest_parts)
 
+    # 伪协议噪音剥离（无论是否已解析出调用都要做）：
+    # - <tool_callback>：deepseek-v4-flash 实测的伪回调头（开标签 + 意图文本、
+    #   不闭合），整块剥到闭标签/下一个 <tool_call>/流末尾
+    # - 孤立 arg_key / arg_value 标签：glm-5.3 函数调用语法残骸
+    rest = re.sub(
+        r"<tool_callback[^>]*>.*?(?:</tool_callback>|(?=<tool_call[>\s])|\Z)",
+        "", rest, flags=re.S,
+    )
+    rest = re.sub(r"</?\s*tool_callback[^>]*>", "", rest)
+    rest = re.sub(r"</?\s*arg_(?:key|value)[^>]*>", "", rest)
+    rest = re.sub(r"\n{3,}", "\n\n", rest)
+
     # 兜底：Trae 原生 <tool_name>/<command>（仅当教学格式没解析出任何调用时）
     if not calls:
+        # 兜底三：函数调用语法（glm-5.3 实测：无视 JSON 教学，标签内直接写
+        # skill_read(intent="...")，常混入孤立 </arg_value> 残骸）
+        def _grab_fn_call(match: re.Match) -> str:
+            name, body = match.group(1), match.group(2)
+            args: dict[str, Any] = {}
+            for k, v1, v2 in _ATTR_VAL_RE.findall(body):
+                args[k.lower()] = v1 if v2 == "" else v2
+            if not args:
+                args = {"input": body.strip()}
+            calls.append(_mk_tool_call(
+                len(calls), name.strip(), json.dumps(args, ensure_ascii=False)))
+            return ""
+
+        fn_call_re = re.compile(
+            r"<tool_call>\s*([A-Za-z_][\w.]*)\s*\(([\s\S]*?)\)\s*</tool_call>",
+            re.I,
+        )
+        rest = fn_call_re.sub(_grab_fn_call, rest)
+        if calls:
+            return rest.strip(), calls
+
         def _grab_native(match: re.Match) -> str:
             calls.append(_mk_tool_call(len(calls), match.group(1), json.dumps(
                 {"command": match.group(2).strip()}, ensure_ascii=False)))
