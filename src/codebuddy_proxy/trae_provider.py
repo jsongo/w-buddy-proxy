@@ -748,10 +748,22 @@ def _valid_bare_call_obj(obj: Any, known_tools: frozenset[str]) -> bool:
 
 
 def _flatten_call_args(obj: dict[str, Any]) -> dict[str, Any]:
-    """从裸 JSON 调用对象提取参数；扁平形态（无 arguments 层）取剩余键。"""
+    """从裸 JSON 调用对象提取参数；扁平形态（无 arguments 层）取剩余键。
+
+    glm-5.3 还会把 arguments 输出成 JSON 字符串（而非对象）：
+    {"name": "web_search", "arguments": "{\"query\": \"...\", \"max_results\": 10}"}
+    —— 解包成 dict，避免下游拿到 {"input": "<整段 JSON 字符串>"}。
+    """
     args = obj.get("arguments", obj.get("args"))
     if args is None:
         args = {k: v for k, v in obj.items() if k not in ("name", "tool")}
+    if isinstance(args, str):
+        try:
+            parsed = json.loads(args)
+            if isinstance(parsed, dict):
+                args = parsed
+        except Exception:
+            pass
     return args if isinstance(args, dict) else {"input": args}
 
 
@@ -1168,6 +1180,13 @@ def _parse_tool_calls(
                 pos3 = e
             out.append(rest[pos3:])
             rest = "".join(out)
+
+    # glm-5.3 实测：正文带 <think>...</think>\n\n</think>（多一个游离闭标签）。
+    # agent 模式不走 _sanitize_agent_leak，think 清洗在这里兜住。
+    if "<think>" in rest or "</think>" in rest:
+        rest = re.sub(r"<think>.*?</think>", "", rest, flags=re.S)
+        rest = re.sub(r"</?\s*think>", "", rest)
+        rest = rest.strip()
 
     return rest.strip(), calls
 

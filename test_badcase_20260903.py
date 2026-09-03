@@ -233,6 +233,28 @@ check("case8 流式正文无泄漏", "web_search" not in streamed4 + tail5,
       f"streamed={streamed4!r} tail={tail5!r}")
 check("case8 流式解析出调用", len(scalls4) == 1, f"n={len(scalls4)}")
 
+# ---- case9：arguments 为 JSON 字符串（glm-5.3 实测 20:3x 变体）----
+args_str_json = chr(39).join(['']) + '{"name": "web_search", "arguments": "{\\\"query\\\": \\\"Scopus 收录期刊\\\", \\"max_results\\\": 10}"}'
+rest, calls = _parse_tool_calls(args_str_json, frozenset({"web_search"}))
+check("case9 调用解析", len(calls) == 1 and calls[0]["function"]["name"] == "web_search", f"calls={calls}")
+if calls:
+    a = __import__("json").loads(calls[0]["function"]["arguments"])
+    check("case9 字符串参数解包", a.get("query") == "Scopus 收录期刊" and a.get("max_results") == 10, f"args={a}")
+
+# case9b：正文游离 </think> 残留清洗
+think_leak = '<think>\nsearch journals\n</think>\n\n</think>剩余正文'
+rest, calls = _parse_tool_calls(think_leak, frozenset({"web_search"}))
+check("case9b think 残留清洗", "think" not in rest and rest == "剩余正文", f"rest={rest!r}")
+
+# case9c：arguments 非法 JSON 字符串保持 input 包裹
+bad_json = '{"name": "web_search", "arguments": "not json"}'
+rest, calls = _parse_tool_calls(bad_json, frozenset({"web_search"}))
+if calls:
+    a = __import__("json").loads(calls[0]["function"]["arguments"])
+    check("case9c 非法 JSON 兜底", a == {"input": "not json"}, f"args={a}")
+else:
+    check("case9c 非法 JSON 兜底", False, "no calls")
+
 print()
 if FAILED:
     print("FAILED:", FAILED)
