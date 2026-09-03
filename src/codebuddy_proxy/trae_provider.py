@@ -1234,7 +1234,13 @@ class TraeProvider(BaseProvider):
                 yield chunk({"role": "assistant", "content": tail})
             if calls:
                 finish = "tool_calls"
-                yield chunk({"tool_calls": calls})
+                # OpenAI 流式协议：tool_call 必须带 index（客户端靠它合并分片），
+                # 首个 delta 带 role；不带 index 会被部分解析器直接丢弃
+                yield chunk({"role": "assistant", "tool_calls": [
+                    {"index": i, "id": c["id"], "type": "function",
+                     "function": c["function"]}
+                    for i, c in enumerate(calls)
+                ]})
         _debug_dump("debug_trae_response", model=model, stream=True,
                     content="".join(dbg_parts))
         yield chunk({}, finish)
