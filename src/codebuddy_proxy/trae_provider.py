@@ -728,18 +728,31 @@ def _tool_names(tools: list[dict[str, Any]] | None) -> frozenset[str] | None:
 def _valid_bare_call_obj(obj: Any, known_tools: frozenset[str]) -> bool:
     """裸 JSON 是否是合法的工具调用对象。
 
-    严格校验（避免误伤正文里的普通 JSON）：name 必须是已知工具名、
-    必须带 arguments/args、不允许出现杂键（intent 是 ethan 教的说明字段，
-    放行）。
+    严格校验（避免误伤正文里的普通 JSON）：name 必须是已知工具名。
+    两种形态放行：
+    - 标准形态：带 arguments/args，且除 name/tool/intent 外无杂键
+      （intent 是 ethan 教的说明字段，放行）；
+    - 扁平形态（glm-5.3 实测）：name 与参数平铺——
+      {"name": "web_search", "query": "...", "max_results": 10}，
+      无 arguments 包裹层，但至少带一个参数键。
     """
     if not isinstance(obj, dict):
         return False
     name = obj.get("name")
     if not isinstance(name, str) or name not in known_tools:
         return False
-    if "arguments" not in obj and "args" not in obj:
-        return False
-    return set(obj) <= {"name", "arguments", "args", "intent", "tool"}
+    if "arguments" in obj or "args" in obj:
+        return set(obj) <= {"name", "arguments", "args", "intent", "tool"}
+    # 扁平形态：name/tool 之外还有键即视为参数平铺
+    return bool(set(obj) - {"name", "tool"})
+
+
+def _flatten_call_args(obj: dict[str, Any]) -> dict[str, Any]:
+    """从裸 JSON 调用对象提取参数；扁平形态（无 arguments 层）取剩余键。"""
+    args = obj.get("arguments", obj.get("args"))
+    if args is None:
+        args = {k: v for k, v in obj.items() if k not in ("name", "tool")}
+    return args if isinstance(args, dict) else {"input": args}
 
 
 class _StreamToolCallSplitter:
@@ -1122,9 +1135,7 @@ def _parse_tool_calls(
                 rest_parts2.append(rest[pos:m.start()].rstrip())
                 for it in items:
                     name = it.get("name") or it.get("tool") or ""
-                    args = it.get("arguments", it.get("args", {}))
-                    if not isinstance(args, dict):
-                        args = {"input": args}
+                    args = _flatten_call_args(it)
                     calls.append(_mk_tool_call(
                         len(calls), str(name), json.dumps(args, ensure_ascii=False)))
                 pos = end
