@@ -199,6 +199,40 @@ tail4, _ = sp3.flush()
 check("case7 普通正文最终放行", "是搜索工具" in (streamed3 + tail4),
       f"streamed={streamed3!r} tail={tail4!r}")
 
+# ---------------------------------------------------------------------------
+# Case 8: glm-5.3 扁平裸 JSON（8787 冒烟实测）：name 与参数平铺、无
+# arguments 包裹层、无 <tool_call> 标签
+# ---------------------------------------------------------------------------
+flat_json = '思考完成。\n{"name": "web_search", "query": "Scopus 数据库 2025 年收录期刊数量", "max_results": 10}'
+rest, calls = _parse_tool_calls(flat_json, frozenset({"web_search", "web_fetch"}))
+check("case8 扁平裸 JSON 解析出调用", len(calls) == 1 and calls[0]["function"]["name"] == "web_search",
+      f"n={len(calls)} rest={rest!r}")
+if calls:
+    a = __import__("json").loads(calls[0]["function"]["arguments"])
+    check("case8 平铺参数提取", a.get("query") == "Scopus 数据库 2025 年收录期刊数量" and a.get("max_results") == 10,
+          f"args={a}")
+check("case8 正文保留", rest.startswith("思考完成。") and "web_search" not in rest, f"rest={rest!r}")
+
+# 标准形态回归：带 arguments 的不受影响
+std_bare = '{"name": "shell", "arguments": {"command": "ls"}}'
+rest, calls = _parse_tool_calls(std_bare, frozenset({"shell"}))
+check("case8 标准形态回归", len(calls) == 1)
+
+# 普通数据 JSON 不误伤：name 不是工具名
+data_json = '{"name": "张三", "age": 30}'
+rest, calls = _parse_tool_calls(data_json, frozenset({"web_search"}))
+check("case8 普通 JSON 不误伤", len(calls) == 0 and "张三" in rest, f"rest={rest!r}")
+
+# 流式：扁平 JSON 跨 chunk
+sp4 = _StreamToolCallSplitter(frozenset({"web_search"}))
+streamed4 = ""
+for k in range(0, len(flat_json), 20):
+    streamed4 += sp4.feed(flat_json[k:k + 20])
+tail5, scalls4 = sp4.flush()
+check("case8 流式正文无泄漏", "web_search" not in streamed4 + tail5,
+      f"streamed={streamed4!r} tail={tail5!r}")
+check("case8 流式解析出调用", len(scalls4) == 1, f"n={len(scalls4)}")
+
 print()
 if FAILED:
     print("FAILED:", FAILED)
