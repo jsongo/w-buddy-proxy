@@ -448,10 +448,14 @@ _LEAK_RE = [
     re.compile(r"<think>.*?</think>", re.S),
     re.compile(r"</?\s*think>"),
     # 伪回调头 <tool_callback>（deepseek-v4-flash 实测：开标签后跟意图文本、
-    # 不闭合也不携带调用，纯粹是协议噪音，整块剥离；未闭合时剥到流末尾）。
+    # 不闭合也不携带调用，纯粹是协议噪音）。剥法与 _parse_tool_calls 统一：
+    # 闭合块整块剥；未闭合但后面跟 <tool_call> 的，剥到调用前（真调用交给
+    # 后续/解析层）；真到流尾都没闭合的（模型放弃调用继续说正文），只剥
+    # 标签壳、保留内部文本——否则伪头之后的正文会被整段吞掉。
     # 必须排在孤立 tool_call 模式之前——tool_call[^>]* 会把 <tool_callback>
     # 误当孤儿 tool_call 标签先剥壳，导致块模式失配、内部文本泄漏
-    re.compile(r"<tool_callback[^>]*>.*?(?:</tool_callback>|\Z)", re.S),
+    re.compile(r"<tool_callback[^>]*>.*?</tool_callback>", re.S),
+    re.compile(r"<tool_callback[^>]*>.*?(?=<tool_call[>\s])", re.S),
     re.compile(r"</?\s*tool_callback[^>]*>"),
     # 孤立 tool_call 标签
     re.compile(r"</?\s*tool_call[^>]*>"),
@@ -547,7 +551,7 @@ class _StreamLeakCleaner:
 # tool_callback：deepseek-v4-flash 实测的伪回调头（开标签 + 意图文本、不闭合），
 # 不扣留的话会当正文流出（下游 UI 直接看到 <tool_callback>…）；扣留后交给
 # _parse_tool_calls 统一剥离
-_TOOL_STREAM_TAGS = ("tool_call", "tool_calls", "tool_action", "tool_name", "tool_callback", "command")
+_TOOL_STREAM_TAGS = ("tool_call", "tool_calls", "tool_action", "tool_name", "tool_callback", "command", "arg_key", "arg_value")
 
 # 裸 JSON 工具调用候选前缀：模型偶尔省略标签，直接在行首输出
 # {"name": ...} 或 [{"name": ...}]（数组包多个调用）
@@ -559,6 +563,94 @@ _BARE_RE = re.compile(r'(?m)^[ \t]*(\[\{"name"|\{"name")')
 # 用起始正则定位 + 引号感知扫描
 _ATTR_TAG_START_RE = re.compile(r"<(?:tool_call|tool_calls|tool_action)\b", re.I)
 _ATTR_VAL_RE = re.compile(r"(\w+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)')")
+
+# 函数调用表达式参数值：k="v" / k='v' / k=7（数字）/ k=true|false|null（裸字面量）
+_KV_VAL_RE = re.compile(
+    r"(\w+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|(-?\d+(?:\.\d+)?)|(true|false|null))",
+    re.I,
+)
+
+# 行首函数调用表达式（裸函数语法兜底的流式扣留锚点）
+_LINE_CALL_EXPR_RE = re.compile(r"(?m)^[ \t]*([A-Za-z_][\w.]*)[ \t]*\(")
+
+_CALL_NAME_RE = re.compile(r"([A-Za-z_][\w.]*)\s*\(")
+
+
+def _parse_kv_args(body: str) -> dict[str, Any]:
+    """解析函数调用表达式参数体 k=v, k2=v2 -> dict（保留键原大小写）。
+
+    相比 _ATTR_VAL_RE 额外支持未加引号的数字/布尔/null（glm-5.3 实测输出
+    web_search(query="...", max_results=7, ...)，max_results 不带引号，
+    旧正则会直接丢掉这个参数）。
+    """
+    args: dict[str, Any] = {}
+    for m in _KV_VAL_RE.finditer(body):
+        key = m.group(1)
+        if m.group(2) is not None:
+            val: Any = m.group(2)
+        elif m.group(3) is not None:
+            val = m.group(3)
+        elif m.group(4) is not None:
+            f = float(m.group(4))
+            val = int(f) if f.is_integer() else f
+        else:
+            val = {"true": True, "false": False, "null": None}[
+                m.group(5).lower()]
+        args[key] = val
+    return args
+
+
+def _find_call_exprs(
+    text: str,
+    names: frozenset[str] | set[str] | None = None,
+) -> list[tuple[str, dict[str, Any], int, int]]:
+    """扫描文本里的函数调用表达式 name(k=v, ...)。
+
+    引号感知 + 括号配对扫描（参数值里可能含括号/逗号），连续多个调用
+    （空格/换行分隔）逐个返回。names 传入时只接受已知工具名（裸文本
+    防误伤）；None 时任意名字都收（调用块内模型已显式标记是调用）。
+    返回 [(name, args_dict, start, end), ...]，end 为右括号后一位。
+    """
+    results: list[tuple[str, dict[str, Any], int, int]] = []
+    pos = 0
+    n = len(text)
+    while True:
+        m = _CALL_NAME_RE.search(text, pos)
+        if not m:
+            break
+        name = m.group(1)
+        # 引号感知扫描到配对的右括号
+        j = m.end()
+        depth = 1
+        quote: str | None = None
+        end = -1
+        while j < n:
+            ch = text[j]
+            if quote is not None:
+                if ch == quote:
+                    quote = None
+            elif ch in ('"', "'"):
+                quote = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+            j += 1
+        if end == -1:
+            # 括号不闭合（截断流）：跳过名字继续扫
+            pos = m.end()
+            continue
+        if names is None or name in names:
+            body = text[m.end():end]
+            args = _parse_kv_args(body)
+            if not args:
+                args = {"input": body.strip()}
+            results.append((name, args, m.start(), end + 1))
+        pos = end + 1
+    return results
 
 
 def _extract_attr_calls(rest: str, calls: list[dict[str, Any]]) -> str:
@@ -711,6 +803,33 @@ class _StreamToolCallSplitter:
                 best = p
         return best
 
+    def _call_expr_pos(self, buf: str) -> int:
+        """行首已知工具名调用表达式的扣留位置（glm-5.3 裸函数语法变体）。
+
+        模型偶尔连 <tool_call> 标签都省掉，直接在行首输出
+        web_search(query="...", ...)（可连续多个，尾随孤立 </arg_value>）。
+        行首 + 已知工具名 + 紧跟 "(" 的组合在正文里极其罕见，值得扣留。
+        含跨 chunk 分裂的前缀（尾行是纯工具名前缀、可能 ( 在下一个 chunk）。
+        """
+        if not self._tools:
+            return -1
+        best = -1
+        for m in _LINE_CALL_EXPR_RE.finditer(buf):
+            if m.group(1) in self._tools:
+                if best == -1 or m.start() < best:
+                    best = m.start()
+        # 尾部行可能是分裂中的候选前缀（如 buf 以行首 'web_sear' 结尾）
+        last_nl = buf.rfind("\n")
+        line = buf[last_nl + 1:]
+        ls = line.lstrip()
+        if ls and re.fullmatch(r"[A-Za-z_][\w.]*", ls) and len(ls) <= max(
+                len(t) for t in self._tools):
+            if any(t.startswith(ls) for t in self._tools):
+                p = last_nl + 1 + (len(line) - len(ls))
+                if best == -1 or p < best:
+                    best = p
+        return best
+
     def feed(self, text: str) -> str:
         self._buf += text
         pos = self._first_tag_pos(self._buf)
@@ -718,6 +837,9 @@ class _StreamToolCallSplitter:
             bp = self._bare_pos(self._buf)
             if bp != -1 and (pos == -1 or bp < pos):
                 pos = bp
+            ep = self._call_expr_pos(self._buf)
+            if ep != -1 and (pos == -1 or ep < pos):
+                pos = ep
         if pos == -1:
             safe, self._buf = self._buf, ""
         else:
@@ -856,6 +978,14 @@ def _parse_tool_calls(
     # 先统一归一成教学的标准单数标签再进主解析。
     content = re.sub(r"</\s*tool_calls\s*>", _TC_CLOSE, content, flags=re.I)
     content = re.sub(r"<\s*tool_calls\s*>", _TC_OPEN, content, flags=re.I)
+    # 伪回调头 <tool_callback>（deepseek-v4-flash 实测）必须在主解析前剥离：
+    # 闭合块整块剥；未闭合剥到下一个 <tool_call> 为止——主循环会把
+    # <tool_call> 消费掉，放后面做前瞻就没有锚点了。剥法与 _LEAK_RE 统一。
+    content = re.sub(r"<tool_callback[^>]*>.*?</tool_callback>", "", content, flags=re.S)
+    content = re.sub(r"<tool_callback[^>]*>.*?(?=<tool_call[>\s])", "", content, flags=re.S)
+    # 记录原文是否带 arg_key/arg_value 残骸：glm-5.3 的坏调用块伴随孤立
+    # </arg_value>，这是「这段文本确实是坏掉的调用」而非正文代码示例的强信号
+    had_arg_debris = bool(re.search(r"</?\s*arg_(?:key|value)", content))
     calls: list[dict[str, Any]] = []
     rest_parts: list[str] = []
     pos = 0
@@ -869,6 +999,7 @@ def _parse_tool_calls(
         j = i + len(_TC_OPEN)
         block_calls: list[tuple[str, str]] = []
         closed = False
+        expr_consumed = False  # 块内表达式路径已整块消费
         # 块内循环：连续解码多个 JSON（复数容器装多个调用），直到闭标签
         while True:
             while j < n and content[j] in " \t\r\n":
@@ -893,25 +1024,37 @@ def _parse_tool_calls(
                         (str(name), json.dumps(args, ensure_ascii=False)))
                 j = end
                 continue
+            # 不是 JSON：可能是 glm-5.3 的函数调用表达式写法——
+            # <tool_call>web_search(query="...", max_results=7) web_search(...)</arg_value></tool_call>
+            # （块内可连续多个调用表达式，混孤立 </arg_value> 残骸）。
+            # 引号感知扫到块尾，全部转成 tool_calls 后整块消费。
+            close = content.find(_TC_CLOSE, j)
+            block_text = content[j:close if close != -1 else n]
+            exprs = _find_call_exprs(block_text, None)
+            if exprs:
+                for name, args, _s, _e in exprs:
+                    calls.append(_mk_tool_call(
+                        len(calls), name, json.dumps(args, ensure_ascii=False)))
+                pos = (close + len(_TC_CLOSE)) if close != -1 else n
+                expr_consumed = True
+                break
             break  # 既不是 JSON 也不是闭标签：块不合法
         if closed and block_calls:
             for name, args_json in block_calls:
                 calls.append(_mk_tool_call(len(calls), name, args_json))
             pos = j
             continue
+        if expr_consumed:
+            continue
         # 不是合法调用块：保留原文继续扫描
         rest_parts.append(content[i:i + len(_TC_OPEN)])
         pos = i + len(_TC_OPEN)
     rest = "".join(rest_parts)
 
-    # 伪协议噪音剥离（无论是否已解析出调用都要做）：
-    # - <tool_callback>：deepseek-v4-flash 实测的伪回调头（开标签 + 意图文本、
-    #   不闭合），整块剥到闭标签/下一个 <tool_call>/流末尾
+    # 残余噪音剥离（无论是否已解析出调用都要做）：
+    # - 孤立 tool_callback 标签壳：未闭合到流尾的（模型放弃调用继续说正文）
+    #   只剥壳、保留内部文本，不能整段吞掉
     # - 孤立 arg_key / arg_value 标签：glm-5.3 函数调用语法残骸
-    rest = re.sub(
-        r"<tool_callback[^>]*>.*?(?:</tool_callback>|(?=<tool_call[>\s])|\Z)",
-        "", rest, flags=re.S,
-    )
     rest = re.sub(r"</?\s*tool_callback[^>]*>", "", rest)
     rest = re.sub(r"</?\s*arg_(?:key|value)[^>]*>", "", rest)
     rest = re.sub(r"\n{3,}", "\n\n", rest)
@@ -922,17 +1065,17 @@ def _parse_tool_calls(
         # skill_read(intent="...")，常混入孤立 </arg_value> 残骸）
         def _grab_fn_call(match: re.Match) -> str:
             name, body = match.group(1), match.group(2)
-            args: dict[str, Any] = {}
-            for k, v1, v2 in _ATTR_VAL_RE.findall(body):
-                args[k.lower()] = v1 if v2 == "" else v2
+            args = _parse_kv_args(body)
             if not args:
                 args = {"input": body.strip()}
             calls.append(_mk_tool_call(
                 len(calls), name.strip(), json.dumps(args, ensure_ascii=False)))
             return ""
 
+        # ) 与 </tool_call> 之间允许夹孤立残骸标签（</arg_value> 等）
         fn_call_re = re.compile(
-            r"<tool_call>\s*([A-Za-z_][\w.]*)\s*\(([\s\S]*?)\)\s*</tool_call>",
+            r"<tool_call>\s*([A-Za-z_][\w.]*)\s*\(([\s\S]*?)\)\s*"
+            r"(?:</[^>]+>\s*)*</tool_call>",
             re.I,
         )
         rest = fn_call_re.sub(_grab_fn_call, rest)
@@ -989,6 +1132,31 @@ def _parse_tool_calls(
                 rest_parts2.append(rest[pos:m.end()])
                 pos = m.end()
         rest = "".join(rest_parts2)
+
+    # 兜底四：裸函数调用表达式（glm-5.3 实测 Scopus 会话变体：
+    # web_search(query="...", max_results=7) web_search(...)</arg_value>
+    # ——无 <tool_call> 包裹、连续多个调用 + 孤立 </arg_value> 残骸）。
+    # 门槛（防误伤正文里的普通代码示例）：
+    # a) 前面所有格式都没解出调用；b) 工具名在请求的 known_tools 里；
+    # c) 原文带 arg_* 残骸（坏调用块的强信号），或表达式位于行首
+    # （流式 splitter 对行首已知工具名调用会主动扣留，两端约定一致）。
+    if not calls and known_tools and (had_arg_debris or _LINE_CALL_EXPR_RE.search(rest)):
+        known = frozenset(known_tools)
+        exprs = _find_call_exprs(rest, known)
+        # 有残骸信号时全部收；没有残骸时只收行首的（inline 的可能是正文示例）
+        if not had_arg_debris:
+            exprs = [e for e in exprs
+                     if e[2] == 0 or rest[e[2] - 1] == "\n"]
+        if exprs:
+            out: list[str] = []
+            pos3 = 0
+            for name, args, s, e in exprs:
+                out.append(rest[pos3:s])
+                calls.append(_mk_tool_call(
+                    len(calls), name, json.dumps(args, ensure_ascii=False)))
+                pos3 = e
+            out.append(rest[pos3:])
+            rest = "".join(out)
 
     return rest.strip(), calls
 
@@ -1544,11 +1712,13 @@ class TraeProvider(BaseProvider):
 
         reasoning = "".join(reasoning_parts)
         content = "".join(content_parts)
-        if sanitize:
-            content = _sanitize_agent_leak(content)
-        tool_calls: list[dict[str, Any]] = []
+        # 顺序关键：带 tools 的请求必须先解析、后清洗——_sanitize_agent_leak
+        # 会把 <tool_call>/</arg_value> 标签全剥掉，先清洗再解析会让解析器
+        # 拿到被拆掉结构的残骸（实测 glm-5.3 函数调用表达式因此整段漏进正文）
         if tools:
             content, tool_calls = _parse_tool_calls(content, _tool_names(tools))
+        if sanitize:
+            content = _sanitize_agent_leak(content)
         _debug_dump("debug_trae_response", model=model, stream=False, content=content,
                     tool_calls=len(tool_calls))
         if not content and not reasoning:

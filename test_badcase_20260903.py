@@ -107,6 +107,98 @@ closed_cb = "<tool_callback>\n意图文本\n</tool_callback>\n<tool_call>\n{\"na
 rest, calls = _parse_tool_calls(closed_cb)
 check("case3 闭合 tool_callback 整块剥离", "意图文本" not in rest and len(calls) == 1, f"rest={rest!r}")
 
+# ---------------------------------------------------------------------------
+# Case 4: 未闭合 tool_callback 且放弃调用（模型继续说正文）——
+# 只剥标签壳，伪头之后的正文必须保留（PR #13 评审意见）
+# ---------------------------------------------------------------------------
+abandon = "<tool_callback>\n用几本同类的书来查\n\n还是直接回答吧：这几本书都不错。"
+rest, calls = _parse_tool_calls(abandon)
+check("case4 正文保留", "还是直接回答吧" in rest, f"rest={rest!r}")
+check("case4 标签壳剥离", "tool_callback" not in rest, f"rest={rest!r}")
+cleaned = _sanitize_agent_leak(abandon)
+check("case4 sanitize 正文保留", "还是直接回答吧" in cleaned and "tool_callback" not in cleaned,
+      f"cleaned={cleaned!r}")
+
+# ---------------------------------------------------------------------------
+# Case 5: glm-5.3 Scopus 会话变体——<tool_call> 块内连续多个函数调用表达式
+# + 孤立 </arg_value> 残骸（用户实测粘贴，ethan 会话 s_20260903_1704_0492）
+# ---------------------------------------------------------------------------
+scopus_wrapped = (
+    '<tool_call>'
+    'web_search(query="Scopus database indexed journals count 2025 2026 coverage", '
+    'max_results=7, language="en-US", intent="核实Scopus收录规模数据") '
+    'web_search(query="Scopus arXiv preprints indexing 预印本 收录", '
+    'max_results=7, language="zh-CN", intent="核实Scopus是否收录arXiv预印本")'
+    '</arg_value></tool_call>'
+)
+rest, calls = _parse_tool_calls(scopus_wrapped)
+check("case5 解析出 2 个 web_search 调用",
+      len(calls) == 2 and all(c["function"]["name"] == "web_search" for c in calls),
+      f"n={len(calls)} rest={rest!r}")
+if len(calls) == 2:
+    a0 = __import__("json").loads(calls[0]["function"]["arguments"])
+    a1 = __import__("json").loads(calls[1]["function"]["arguments"])
+    check("case5 引号参数保留", a0.get("query") == "Scopus database indexed journals count 2025 2026 coverage")
+    check("case5 未加引号数字参数不丢", a0.get("max_results") == 7, f"a0={a0}")
+    check("case5 两调用参数独立", a1.get("language") == "zh-CN" and a1.get("max_results") == 7)
+check("case5 正文无残骸", "web_search" not in rest and "arg_value" not in rest, f"rest={rest!r}")
+
+# ---------------------------------------------------------------------------
+# Case 6: 同源变体——完全无包裹的裸函数调用表达式（残骸伴随）
+# ---------------------------------------------------------------------------
+scopus_bare = (
+    'web_search(query="Scopus database indexed journals count 2025 2026 coverage", '
+    'max_results=7, language="en-US", intent="核实Scopus收录规模数据") '
+    'web_search(query="Scopus arXiv preprints indexing 预印本 收录", '
+    'max_results=7, language="zh-CN", intent="核实Scopus是否收录arXiv预印本")'
+    '</arg_value>'
+)
+rest, calls = _parse_tool_calls(scopus_bare, frozenset({"web_search", "web_fetch"}))
+check("case6 裸表达式解析出 2 个调用",
+      len(calls) == 2 and all(c["function"]["name"] == "web_search" for c in calls),
+      f"n={len(calls)} rest={rest!r}")
+check("case6 正文无残骸", "web_search" not in rest and "arg_value" not in rest, f"rest={rest!r}")
+
+# 未知工具名的裸表达式不动（防误伤）
+prose_case = 'foo(query="x") bar(y=1)'
+rest, calls = _parse_tool_calls(prose_case, frozenset({"web_search"}))
+check("case6 未知工具名不转换", len(calls) == 0 and "foo(query" in rest, f"rest={rest!r}")
+
+# 无残骸时，行中 inline 的已知工具名表达式不转换（可能是正文代码示例）
+inline_prose = '你可以用 web_search(query="x") 来搜索，注意参数写法。'
+rest, calls = _parse_tool_calls(inline_prose, frozenset({"web_search"}))
+check("case6 inline 示例不转换", len(calls) == 0 and "web_search" in rest, f"rest={rest!r}")
+
+# ---------------------------------------------------------------------------
+# Case 7: 流式路径——裸函数调用表达式跨 chunk 到达，splitter 必须扣留并解析
+# ---------------------------------------------------------------------------
+sp = _StreamToolCallSplitter(frozenset({"web_search", "web_fetch"}))
+streamed = ""
+for k in range(0, len(scopus_bare), 25):
+    streamed += sp.feed(scopus_bare[k:k + 25])
+tail, scalls = sp.flush()
+tail2, scalls2 = _parse_tool_calls(tail, frozenset({"web_search", "web_fetch"}))
+check("case7 流式正文无泄漏", "web_search" not in streamed + tail2, f"streamed={streamed!r} tail={tail2!r}")
+check("case7 流式解析出调用", len(scalls) + len(scalls2) == 2,
+      f"scalls={len(scalls)} scalls2={len(scalls2)}")
+
+# 带包裹的变体流式也要扣住
+sp2 = _StreamToolCallSplitter(frozenset({"web_search"}))
+streamed2 = ""
+for k in range(0, len(scopus_wrapped), 30):
+    streamed2 += sp2.feed(scopus_wrapped[k:k + 30])
+tail3, scalls3 = sp2.flush()
+check("case7 包裹变体流式无泄漏", "web_search" not in streamed2 + tail3, f"{(streamed2 + tail3)!r}")
+check("case7 包裹变体流式解析", len(scalls3) == 2, f"n={len(scalls3)}")
+
+# 正文行首恰好像调用的普通文本（无残骸）最终要放行，不能吞正文
+prose_stream = "web_search 是搜索工具，不是试错工具。"
+sp3 = _StreamToolCallSplitter(frozenset({"web_search"}))
+streamed3 = sp3.feed(prose_stream)
+tail4, _ = sp3.flush()
+check("case7 普通正文最终放行", "是搜索工具" in (streamed3 + tail4),
+      f"streamed={streamed3!r} tail={tail4!r}")
+
 print()
 if FAILED:
     print("FAILED:", FAILED)
