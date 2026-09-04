@@ -69,6 +69,9 @@ ENDPOINTS = [
     "/api/agent/v3/create_agent_task",
 ]
 
+# Trae Work 通道同端点最大尝试次数（含首次）：覆盖 IncompleteRead 等瞬态断流
+_WORK_CHAT_MAX_ATTEMPTS = 3
+
 # 模型名映射：外部别名 -> Trae 内部 config_name（大小写敏感，须与下方实测白名单一致）
 MODEL_MAP: dict[str, str] = {
     # "claude-opus-4-7": "glm-5.3",
@@ -1694,25 +1697,49 @@ def _send_trae_work_chat(
     }
 
     url = f"{BASE_URL_CN}/api/agent/v3/llm_utils_chat"
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode("utf-8"),
-        headers=headers,
-        method="POST",
+    # 上游断流多为瞬态（实测：长响应读到一半连接被关 → http.client.IncompleteRead，
+    # 曾被流式层当正文吐成 "[Error: IncompleteRead(...)]"）。读失败后丢弃半截响应，
+    # 同端点退避重试，避免一次网络抖动作废整轮长生成。
+    last_error: Exception | None = None
+    for attempt in range(1, _WORK_CHAT_MAX_ATTEMPTS + 1):
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                _debug_dump(
+                    "debug_trae_upstream",
+                    model=trae_model,
+                    function=body["function"],
+                    raw=raw[:20000],
+                )
+                return raw
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")[:500]
+            raise HTTPException(status_code=502, detail=f"trae work chat failed: {e.code} {detail}")
+        except Exception as e:
+            # HTTPError 之外一律视为瞬态网络错误（IncompleteRead / 连接重置 / 超时等），
+            # 保留原始异常重试；非瞬态错误重试 3 次也会快速失败，代价可接受。
+            last_error = e
+            if attempt < _WORK_CHAT_MAX_ATTEMPTS:
+                log.warning(
+                    "Trae Work chat attempt %d/%d failed (%s: %s), retrying",
+                    attempt, _WORK_CHAT_MAX_ATTEMPTS, type(e).__name__, e,
+                )
+                time.sleep(attempt)
+            else:
+                log.error(
+                    "Trae Work chat failed after %d attempts: %s: %s",
+                    _WORK_CHAT_MAX_ATTEMPTS, type(e).__name__, e,
+                )
+    raise HTTPException(
+        status_code=502,
+        detail=f"trae work chat failed after {_WORK_CHAT_MAX_ATTEMPTS} attempts: {last_error}",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            _debug_dump(
-                "debug_trae_upstream",
-                model=trae_model,
-                function=body["function"],
-                raw=raw[:20000],
-            )
-            return raw
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", errors="replace")[:500]
-        raise HTTPException(status_code=502, detail=f"trae work chat failed: {e.code} {detail}")
 
 
 # ───────────────────────── 认证 ─────────────────────────
