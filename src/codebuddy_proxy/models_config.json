@@ -65,7 +65,7 @@
       "max_input": 200000,
       "max_output": 48000,
       "tool_call": true,
-      "images": false,
+      "images": true,
       "reasoning": true,
       "credits": "x0.06 credits",
       "desc": "GLM-5.3 Flash, fast reasoning model"
