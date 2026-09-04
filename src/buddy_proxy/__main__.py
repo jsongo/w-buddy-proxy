@@ -28,6 +28,7 @@ import os
 import pathlib
 
 import uvicorn
+from fastapi import HTTPException
 
 from buddy_proxy.codebuddy_client_demo import CodeBuddyClient
 from buddy_proxy.providers import BaseProvider
@@ -86,6 +87,9 @@ def main():
                         help="启用豆包 provider（自研内联，直连豆包工作 App CDP）")
     parser.add_argument("--trae", action="store_true", default=os.getenv("TRAE_ENABLED", "") == "1",
                         help="启用 Trae provider（解密 Trae IDE 登录态，直连底层模型）")
+    parser.add_argument("--zcode", action="store_true", default=os.getenv("ZCODE_ENABLED", "") == "1",
+                        help="启用 Zcode provider（智谱 GLM，Anthropic 端点直通；"
+                             "凭据取 ZCODE_API_KEY / secrets / ~/.zcode/v2/config.json）")
     parser.add_argument("--default-provider", default=os.getenv("PROXY_DEFAULT_PROVIDER", "codebuddy"),
                         help="兜底通道：模型名未命中任何 provider 时转发到哪个通道 "
                              "（codebuddy/trae/doubao，默认 codebuddy；可用 PROXY_DEFAULT_PROVIDER 覆盖）")
@@ -123,6 +127,20 @@ def main():
         print("[Trae] Enabled")
     else:
         print("[Trae] Disabled (pass --trae or TRAE_ENABLED=1 to enable)")
+
+    if args.zcode:
+        from buddy_proxy.zcode_provider import ZcodeProvider
+
+        zcode = ZcodeProvider()
+        try:
+            zcode.ensure_auth()  # 启动时校验凭证，给出清晰的配置提示
+        except HTTPException as exc:
+            logger.warning("zcode provider 认证未就绪: %s", exc.detail)
+        providers[zcode.id] = zcode
+        logger.info("Zcode provider enabled (%s)", zcode.health().get("base_url"))
+        print("[Zcode] Enabled (BigModel GLM)")
+    else:
+        print("[Zcode] Disabled (pass --zcode or ZCODE_ENABLED=1 to enable)")
 
     # 校验兜底通道：必须是 codebuddy 或已启用的 provider id
     if args.default_provider != "codebuddy" and args.default_provider not in providers:
