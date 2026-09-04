@@ -167,7 +167,10 @@ check("case6 未知工具名不转换", len(calls) == 0 and "foo(query" in rest,
 # 无残骸时，行中 inline 的已知工具名表达式不转换（可能是正文代码示例）
 inline_prose = '你可以用 web_search(query="x") 来搜索，注意参数写法。'
 rest, calls = _parse_tool_calls(inline_prose, frozenset({"web_search"}))
-check("case6 inline 示例不转换", len(calls) == 0 and "web_search" in rest, f"rest={rest!r}")
+# 2026-09-05 起：inline 强证据（已知工具名 + ( + 参数赋值）按调用回收/
+# 丢弃——防泄漏优先，agent 下一轮自会重试；纯文字提及（无调用语法）不受影响
+check("case6 inline 强证据回收", len(calls) == 1 and "web_search(query" not in rest,
+      f"n={len(calls)} rest={rest!r}")
 
 # ---------------------------------------------------------------------------
 # Case 7: 流式路径——裸函数调用表达式跨 chunk 到达，splitter 必须扣留并解析
