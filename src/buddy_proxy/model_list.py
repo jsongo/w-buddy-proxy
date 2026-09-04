@@ -9,7 +9,7 @@ from typing import Any, Optional
 
 import httpx
 
-from codebuddy_proxy.state import diagnostic, get_state
+from buddy_proxy.state import diagnostic, get_state
 
 
 class RemoteConfigCache:

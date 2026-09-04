@@ -17,9 +17,9 @@ dev = [
 ]
 
 [project.scripts]
-w-buddy-proxy = "codebuddy_proxy.__main__:main"
-codebuddy-proxy = "codebuddy_proxy.__main__:main"
-trae-cli = "codebuddy_proxy.trae_provider:_cli"
+w-buddy-proxy = "buddy_proxy.__main__:main"
+buddy-proxy = "buddy_proxy.__main__:main"
+trae-cli = "buddy_proxy.trae_provider:_cli"
 
 [build-system]
 requires = ["setuptools>=61", "wheel"]
@@ -29,7 +29,7 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-codebuddy_proxy = ["models_config.json"]
+buddy_proxy = ["models_config.json"]
 
 [dependency-groups]
 dev = [

@@ -3,7 +3,7 @@ import json
 import sys
 
 sys.path.insert(0, "src")
-from codebuddy_proxy.trae_provider import (  # noqa: E402
+from buddy_proxy.trae_provider import (  # noqa: E402
     _parse_tool_calls,
     _StreamToolCallSplitter,
     _TC_OPEN,

@@ -16,9 +16,9 @@ from unittest import mock
 import pytest
 from fastapi.testclient import TestClient
 
-from codebuddy_proxy import __main__ as m
-from codebuddy_proxy import state as st
-from codebuddy_proxy import codebuddy_provider as cbp
+from buddy_proxy import __main__ as m
+from buddy_proxy import state as st
+from buddy_proxy import codebuddy_provider as cbp
 
 
 # ---------------------------------------------------------------------------

@@ -15,9 +15,9 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
 
-from codebuddy_proxy.codebuddy_client_demo import CodeBuddyClient
-from codebuddy_proxy.providers import BaseProvider
-from codebuddy_proxy.logging_setup import get_runtime_info
+from buddy_proxy.codebuddy_client_demo import CodeBuddyClient
+from buddy_proxy.providers import BaseProvider
+from buddy_proxy.logging_setup import get_runtime_info
 
 
 class ProxyState:
