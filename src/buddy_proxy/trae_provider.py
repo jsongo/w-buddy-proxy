@@ -490,6 +490,13 @@ _LEAK_RE = [
     re.compile(r"</?\s*tool_call[^>]*>"),
     # 孤立 arg_key / arg_value 标签（工具调用残骸，glm-5.3 实测）
     re.compile(r"</?\s*arg_(?:key|value)[^>]*>"),
+    # seed 协议块（doubao-seed-evolving 实测 s_20260905_0233_f291）：
+    # <seed:tool_call><function name="..."><parameter ...>...</parameter></function></seed:tool_call>
+    re.compile(r"<seed:tool_call>[\s\S]*?(?:</seed:tool_call>|\Z)", re.I),
+    re.compile(r"</?\s*seed:tool_call[^>]*>", re.I),
+    re.compile(r"<function\s+name=[^>]*>[\s\S]*?</function>", re.I),
+    re.compile(r"</?\s*function[^>]*>", re.I),
+    re.compile(r"</?\s*parameter[^>]*>", re.I),
     # 工具执行失败的提示行
     re.compile(r"执行过程发生错误[:：][^\n]*"),
 ]
@@ -505,6 +512,7 @@ def _sanitize_agent_leak(text: str) -> str:
         "Command", "tool_call", "tool_action", "tool_name",
         "tool_callback", "<command", "arg_value", "arg_key",
         "think", "执行过程发生错误",
+        "seed:tool_call", "<function", "<parameter",
     )):
         return text
     for pat in _LEAK_RE:
@@ -513,7 +521,8 @@ def _sanitize_agent_leak(text: str) -> str:
 
 
 # 泄漏标签名（流式扣留判断用；大小写不敏感）
-_LEAK_TAG_NAMES = ("tool_action", "tool_name", "tool_call", "tool_callback", "think", "command")
+_LEAK_TAG_NAMES = ("tool_action", "tool_name", "tool_call", "tool_callback",
+                   "think", "command", "seed:tool_call", "function", "parameter")
 
 
 def _stream_hold_pos(buf: str, tags: tuple[str, ...] = _LEAK_TAG_NAMES) -> int:
@@ -580,7 +589,7 @@ class _StreamLeakCleaner:
 # tool_callback：deepseek-v4-flash 实测的伪回调头（开标签 + 意图文本、不闭合），
 # 不扣留的话会当正文流出（下游 UI 直接看到 <tool_callback>…）；扣留后交给
 # _parse_tool_calls 统一剥离
-_TOOL_STREAM_TAGS = ("tool_call", "tool_calls", "tool_action", "tool_name", "tool_callback", "command", "arg_key", "arg_value")
+_TOOL_STREAM_TAGS = ("tool_call", "tool_calls", "tool_action", "tool_name", "tool_callback", "command", "arg_key", "arg_value", "seed:tool_call", "function", "parameter")
 
 # 裸 JSON 工具调用候选前缀：模型偶尔省略标签，直接在行首输出
 # {"name": ...} 或 [{"name": ...}]（数组包多个调用）
@@ -969,6 +978,222 @@ def _repair_json_quotes(s: str) -> str | None:
     return "".join(out)
 
 
+_JSON_VALID_ESCAPES = set('"\\/bfnrtu')
+_JSON_HEX = set("0123456789abcdefABCDEF")
+
+
+def _repair_invalid_escapes(s: str) -> str:
+    r"""修复 JSON 字符串值里非法的 \ 转义：\X -> \\X。
+
+    glm-5.3-flash 实测（s_20260804_0200_eb1d）：command 值里嵌 python /
+    正则脚本，脚本自身的 \d \s . 等单反斜杠序列对 JSON 是非法转义
+    （json.loads 报 Invalid \escape），现有引号修复管不了这类。把非法
+    \X 双写成 \\X，解码后无损还原为原文 \X。
+    """
+    if "\\" not in s:
+        return s
+    out: list[str] = []
+    i, n = 0, len(s)
+    while i < n:
+        ch = s[i]
+        if ch == "\\":
+            if i + 1 >= n:
+                # 尾部孤立反斜杠（截断流常见）：按字面量处理
+                out.append("\\\\")
+                i += 1
+                continue
+            nxt = s[i + 1]
+            if nxt == "u":
+                hexrun = s[i + 2:i + 6]
+                if len(hexrun) == 4 and all(c in _JSON_HEX for c in hexrun):
+                    out.append(s[i:i + 6])
+                    i += 6
+                    continue
+            elif nxt in _JSON_VALID_ESCAPES:
+                out.append(s[i:i + 2])
+                i += 2
+                continue
+            out.append("\\\\")
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _repair_truncated_json(s: str) -> Any | None:
+    """修复被截断的 JSON 对象/数组（流断在结构中间）。
+
+    实测（s_20260905_0141_3a19）：流断在裸调用尾部，最外层 } 缺失。
+    策略：字符串状态机扫描记录括号栈；结束仍在字符串里 → 补闭合引号；
+    按栈深逆序补 } / ] 后尝试解析。仍失败则逐步回退到最后几个结构
+    分隔符（, : { } [ ]，字符串外的）之前重试——会丢尾部半截键值，
+    但保住前面已完整的参数。返回解析结果，修不动返回 None。
+    """
+    stripped = s.strip()
+    if not stripped or stripped[0] not in "{[":
+        return None
+
+    def scan(text: str) -> tuple[list[str], bool, list[int]]:
+        stack: list[str] = []
+        seps: list[int] = []
+        in_string = False
+        i, n = 0, len(text)
+        while i < n:
+            ch = text[i]
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == '"':
+                if not in_string:
+                    in_string = True
+                elif _quote_is_close(text, i):
+                    in_string = False
+                i += 1
+                continue
+            if not in_string:
+                if ch in "{[":
+                    stack.append("}" if ch == "{" else "]")
+                    seps.append(i)
+                elif ch in "}]":
+                    if stack:
+                        stack.pop()
+                    seps.append(i)
+                elif ch in ",:":
+                    seps.append(i)
+            i += 1
+        return stack, in_string, seps
+
+    fixed = _repair_invalid_escapes(stripped)
+    _, in_string, seps = scan(fixed)
+    base = fixed + '"' if in_string else fixed
+    # 从破坏最小的候选开始：整段补齐括号 → 逐个回退到结构分隔符之前
+    cut_points = [len(base)]
+    cut_points += [p for p in reversed(seps) if p < len(base)][:6]
+    for cut in dict.fromkeys(cut_points):
+        frag = base[:cut]
+        st, ins, _ = scan(frag)
+        if ins:
+            frag += '"'
+            st, _, _ = scan(frag)
+        try:
+            return json.loads(frag + "".join(reversed(st)), strict=False)
+        except ValueError:
+            continue
+    return None
+
+
+def _repair_call_json(s: str) -> tuple[Any, int] | None:
+    """统一修复管线：坏 JSON 调用 → (解析结果, 消费到的原始偏移)。
+
+    覆盖三类实测损坏（此前都会整段泄漏进正文）：
+    a) 非法 \\ 转义（脚本/正则的单反斜杠）——_repair_invalid_escapes；
+    b) 字符串值里未转义双引号——_repair_json_quotes；
+    c) 尾部截断（缺最外层 } / 断在字符串中间）——_repair_truncated_json。
+    边界平衡（_find_obj_extent 找得到）走 a+b 后 strict=False 解析
+    （容忍字面换行）；不平衡走 c。返回 None 表示修不动。
+    """
+    if not s or s[0] not in "{[":
+        return None
+    raw_end = _find_obj_extent(s, 0)
+    if raw_end != -1:
+        fixed = _repair_invalid_escapes(s[:raw_end])
+        qr = _repair_json_quotes(fixed)
+        if qr is not None:
+            fixed = qr
+        try:
+            return json.loads(fixed, strict=False), raw_end
+        except ValueError:
+            pass
+        return None
+    obj = _repair_truncated_json(s)
+    if obj is None:
+        return None
+    return obj, len(s)
+
+
+def _peek_call_name(s: str) -> str:
+    """从坏调用原文里提取工具名（修复全失败时判断是否丢弃的依据）。"""
+    m = re.search(r'"(?:name|tool)"\s*:\s*"([^"\n]*)"', s)
+    return m.group(1) if m else ""
+
+
+def _loose_kv_plausible(seg: str, tools: frozenset[str]) -> bool:
+    """seg（从行首 name 起）是否仍是散装调用形态的前缀（含完整形态）。
+
+    形态：?name?[ \t]*: "工具名" <空白/逗号/换行> arguments[ \t]*: {...
+    name 键可带引号（实测变体：{"name": "x", "arguments": {...}} 外层
+    大括号被删后剩下行首 "name": ...）。逐段消费，任一段与允许的前缀
+    不符即发散。工具名已闭合但不在已知列表 → 发散（放行，正文里的
+    YAML/示例不吞）。
+    """
+    seg = seg.lstrip(" \t")
+    if not seg:
+        return False
+    if seg[0] == '"':
+        # 引号键：必须是 "name" 的发展前缀（"na / "name / "name" / "name":）
+        kw = '"name"'
+        if not kw.startswith(seg):
+            if not seg.startswith(kw):
+                return False
+            seg = seg[len(kw):]
+        else:
+            return True
+    else:
+        if not seg.startswith("name"):
+            return bool(seg) and "name".startswith(seg)
+        seg = seg[4:]
+        if seg.startswith('"'):
+            seg = seg[1:]        # name": 形态（外层 { 被删的损坏变体）
+    n = len(seg)
+
+    def eat_ws(j: int) -> int:
+        while j < n and seg[j] in " \t":
+            j += 1
+        return j
+
+    i = eat_ws(0)
+    if i >= n:
+        return True          # 冒号还在路上
+    if seg[i] != ":":
+        return False
+    i = eat_ws(i + 1)
+    if i >= n:
+        return True
+    if seg[i] != '"':
+        return False
+    q = seg.find('"', i + 1)
+    if q == -1:
+        return "\n" not in seg[i:]   # 工具名未闭合：跨行即发散
+    name = seg[i + 1:q]
+    if not name or name not in tools:
+        return False
+    # 工具名之后：空白/逗号/换行 + arguments 关键字（带不带引号都认）
+    k = q + 1
+    while k < n and seg[k] in " \t\r\n,":
+        k += 1
+    if k >= n:
+        return True          # 等待 arguments
+    if seg[k] == '"':
+        k += 1
+        if k >= n:
+            return True
+    if not seg.startswith("arguments", k):
+        return "arguments".startswith(seg[k:])
+    k += len("arguments")
+    if k < n and seg[k] == '"':
+        k += 1
+    k = eat_ws(k)
+    if k >= n:
+        return True
+    if seg[k] != ":":
+        return False
+    k = eat_ws(k + 1)
+    if k >= n:
+        return True
+    return seg[k] == "{"     # 对象已开：扣到 flush 统一解析
+
+
 class _StreamToolCallSplitter:
     """流式工具调用切分器：正文按 chunk 透传，工具调用块整段扣留。
 
@@ -991,26 +1216,37 @@ class _StreamToolCallSplitter:
         best = -1
         for tag in _TOOL_STREAM_TAGS:
             start = 0
-            opener = "<" + tag
-            while True:
-                i = low.find(opener, start)
-                if i == -1:
+            # 开标签 + 闭标签都要扣（</arg_value> 类闭合残骸实测会夹正文流出）
+            for opener in ("<" + tag, "</" + tag):
+                while True:
+                    i = low.find(opener, start)
+                    if i == -1:
+                        break
+                    after = low[i + len(opener): i + len(opener) + 1]
+                    if after in ("", ">", "/", " ", "\t", "\n"):
+                        if best == -1 or i < best:
+                            best = i
+                        break
+                    start = i + 1
+        # 部分标签前缀（跨 chunk 分裂 / 标签名中间被塞了残骸标签）：取最早
+        # 的未闭合 "<"。片段取到下一个 "<" 或 ">" 为止——用 rfind 取最后
+        # 一个 "<" 会把前面的半截标签（如 "<tool_c<tool_callback>all>"
+        # 里的 "<tool_c"）当安全文本放出去
+        j = low.find("<")
+        while j != -1:
+            nxt_lt = low.find("<", j + 1)
+            frag = buf[j + 1: nxt_lt if nxt_lt != -1 else len(buf)]
+            if ">" in frag:
+                if nxt_lt == -1:
                     break
-                after = low[i + len(opener): i + len(opener) + 1]
-                if after in ("", ">", "/", " ", "\t", "\n"):
-                    if best == -1 or i < best:
-                        best = i
-                    break
-                start = i + 1
-        if best != -1:
-            return best
-        # 尾部裸 "<" 可能是分裂的标签名前缀，扣住防漏
-        j = buf.rfind("<")
-        if j != -1 and ">" not in buf[j:]:
-            partial = buf[j + 1:].lower().lstrip("/")
+                j = nxt_lt
+                continue
+            partial = frag.lower().lstrip("/ \t")
             if any(t.startswith(partial) for t in _TOOL_STREAM_TAGS):
-                return j
-        return -1
+                if best == -1 or j < best:
+                    best = j
+            break
+        return best
 
     def _bare_pos(self, buf: str) -> int:
         """行首裸 JSON 调用候选位置（含跨 chunk 分裂的前缀）。"""
@@ -1020,15 +1256,57 @@ class _StreamToolCallSplitter:
         m = _BARE_RE.search(buf)
         if m:
             best = m.start(1)
-        # 尾部行可能是分裂中的候选前缀（如 buf 以 '{"na' 结尾）
+        # 尾部行可能是分裂中的候选前缀（如 buf 以 '{"na' 结尾）；整候选开头
+        # （如 '{"name"' 恰好等于尾行）也扣——flush 端 _BARE_RE 能处理
         last_nl = buf.rfind("\n")
         line = buf[last_nl + 1:]
         ls = line.lstrip()
-        if ls and any(c.startswith(ls) and len(ls) < len(c) for c in _BARE_CANDS):
+        if ls and any(c.startswith(ls) or ls.startswith(c) for c in _BARE_CANDS):
             p = last_nl + 1 + (len(line) - len(ls))
             if best == -1 or p < best:
                 best = p
         return best
+
+    def _loose_kv_pos(self, buf: str) -> int:
+        """行首散装 name:/arguments: 调用的扣留位置（deepseek-v4-flash 实测）。
+
+        形态：name: "shell"
+              arguments: {"command": ...}
+        外层大括号与标签全省；name 键可带引号（外层 { 被删的损坏变体）。
+        行首 name 且后续与该形态前缀吻合时扣留；发散（name 非已知工具、
+        后续不是 arguments:、工具名跨行未闭合）立即返回 -1 放行，
+        误伤窗口只有一两行。
+        """
+        if not self._tools:
+            return -1
+        for m in re.finditer(r"(?m)^[ \t]*\"?name\b", buf):
+            if _loose_kv_plausible(buf[m.start():], self._tools):
+                return m.start()
+        # 尾部行可能是发展中的 name 前缀（跨 chunk 分裂，如 buf 以 'na' 结尾）
+        last_nl = buf.rfind("\n")
+        line = buf[last_nl + 1:]
+        ls = line.lstrip()
+        if ls and len(ls) <= len('"name"') and (
+                '"name"'.startswith(ls) or "name".startswith(ls)):
+            return last_nl + 1 + (len(line) - len(ls))
+        return -1
+
+    def _inline_intent_pos(self, buf: str) -> int:
+        """行内强证据调用的扣留位置（正文与调用连写无换行的变体）。
+
+        与闸门的行内模式一致：已知工具名 + arguments 键 / 参数赋值同现，
+        单独出现工具名不扣（正文里提到工具名很常见）。
+        """
+        if not self._tools:
+            return -1
+        tools_alt = "|".join(
+            sorted((re.escape(t) for t in self._tools), key=len, reverse=True))
+        m = re.search(
+            r'\{\s*"?name"?\s*:[ \t]*"(?:' + tools_alt + r')"[^\n]{0,200}?"arguments"'
+            r'|name\s*:\s*"(?:' + tools_alt + r')"[ \t\r\n]*,?[ \t\r\n]*arguments\s*:'
+            r'|\b(?:' + tools_alt + r')[ \t]*\([ \t]{0,40}[A-Za-z_]\w*[ \t]*=',
+            buf)
+        return m.start() if m else -1
 
     def _call_expr_pos(self, buf: str) -> int:
         """行首已知工具名调用表达式的扣留位置（glm-5.3 裸函数语法变体）。
@@ -1086,6 +1364,56 @@ class _StreamToolCallSplitter:
                         break
         return best
 
+    def _tail_hold_pos(self, buf: str) -> int:
+        """尾部发展中候选的扣留位置（行内调用证据天然跨 chunk）。
+
+        正文与调用连写（无换行）时，「{"name": "tool"...arguments」这类
+        证据要若干 chunk 才凑齐——按完整证据扣留会先把开头当正文放出。
+        这里检查缓冲区尾部是否仍是某个调用形态的"发展前缀"：是则从候选
+        起点扣住，下一个 chunk 发散（变成普通正文）立即释放；到 flush 还
+        扣着就交给统一解析/闸门。尾部有界（几十~几百字符），误扣不会
+        无限拖延输出；到 flush 仍未发散的尾部由解析/闸门统一处置。
+        """
+        if not self._tools:
+            return -1
+        if not hasattr(self, "_tail_res"):
+            tools_alt = "|".join(
+                sorted((re.escape(t) for t in self._tools), key=len, reverse=True))
+            # arguments 的逐字符可选发展：a(?:r(?:g(?:...(?:s)?)?)...)?
+            arg_dev = "a" + "".join("(?:%s" % ch for ch in "rguments") + ")?" * 8
+            self._tools_alt = tools_alt
+            self._tail_res = (
+                # {"name 逐字符发展（值可有可无——{ 一出现就扣，发散即放）
+                re.compile(r'\{\s*"?\s*(?:n(?:a(?:m(?:e)?)?)?)?\s*"?\s*'
+                           r':?[ \t]*"?(?:[A-Za-z_][\w.\-]{0,40})?"?$'),
+                # name: "tool" [\\s,]* arguments 发展（值可有可无——
+                # name: 一出现就扣，发散即放）
+                re.compile(r'\bname"?\s*:[ \t]*"?(?:[A-Za-z_][\w.\-]{0,40})?"?'
+                           r'[ \t\r\n,]*(?:' + arg_dev + r')?\s*:?\s*\{?$'),
+                # 已知工具名 + ( 参数发展
+                re.compile(r'\b(?:' + tools_alt + r')\s*\(\s*[^)\n]{0,200}$'),
+            )
+        best = -1
+        for pat in self._tail_res:
+            m = pat.search(buf)
+            if m and (best == -1 or m.start() < best):
+                best = m.start()
+        # 裸 JSON 参数区深度扣留（不限长，大 payload 的 content 可达数百 KB）：
+        # {"name": "已知工具" 前缀一旦出现，扣住直到参数区闭合或流结束
+        m = re.search(r'\{\s*"?name"?\s*:\s*"?(?:' + self._tools_alt + r')', buf)
+        if m:
+            b = buf.find("{", m.end())
+            if b == -1 or _find_obj_extent(buf, b) == -1:
+                if best == -1 or m.start() < best:
+                    best = m.start()
+        # 工具名前缀尾部（含单字符、完整名）：tool( 表达式跨 chunk 发展；
+        # 完整名后跟非 ( 时下一步即发散，误扣窗口一两个 chunk
+        m2 = re.search(r'[A-Za-z_][\w.]{0,31}$', buf)
+        if m2 and any(t.startswith(m2.group(0)) for t in self._tools):
+            if best == -1 or m2.start() < best:
+                best = m2.start()
+        return best
+
     def feed(self, text: str) -> str:
         self._buf += text
         pos = self._first_tag_pos(self._buf)
@@ -1099,6 +1427,15 @@ class _StreamToolCallSplitter:
             cp = self._colon_pos(self._buf)
             if cp != -1 and (pos == -1 or cp < pos):
                 pos = cp
+            lp = self._loose_kv_pos(self._buf)
+            if lp != -1 and (pos == -1 or lp < pos):
+                pos = lp
+            tp = self._tail_hold_pos(self._buf)
+            if tp != -1 and (pos == -1 or tp < pos):
+                pos = tp
+            ip = self._inline_intent_pos(self._buf)
+            if ip != -1 and (pos == -1 or ip < pos):
+                pos = ip
         if pos == -1:
             safe, self._buf = self._buf, ""
         else:
@@ -1159,6 +1496,104 @@ def _looks_like_agent_request(messages: list[dict[str, Any]], body: dict[str, An
 _TC_OPEN = '<tool_call>'
 _TC_CLOSE = '</tool_call>'
 _TOOL_DECODER = json.JSONDecoder()
+
+# 散装键值调用（deepseek-v4-flash 实测 s_20260902_2130_c8bd）：外层大括号
+# 与标签全省，name: "shell" 与 arguments: {...} 直接散装两行
+_LOOSE_KV_RE = re.compile(
+    r'(?m)^[ \t]*name[ \t]*:[ \t]*"(?P<name>[^"\n]+)"'
+    r'[ \t\r\n]*,?[ \t\r\n]*arguments[ \t]*:[ \t]*\{')
+
+# 泄漏闸门的证据提取：从调用开头段里取工具名。宽松匹配——坏调用的
+# name 键本身可能已损坏（缺引号/缺冒号/值截断），行首调用语法开头 +
+# 已知工具名的组合已经足够强，键的形态不苛求
+_GATE_NAME_RES = (
+    re.compile(r'[ \t]*(?:\{[\s]*|[{,][ \t]*)"?name"?[ \t]*:[ \t]*"?([A-Za-z_][\w.-]*)'),
+    re.compile(r'[ \t]*name"?[ \t]*:[ \t]*"?([A-Za-z_][\w.-]*)'),
+)
+
+
+def _gate_tool_name(seg: str) -> str:
+    """闸门证据提取：从调用开头段里取出工具名（JSON 键 / 散装 name:）。"""
+    for pat in _GATE_NAME_RES:
+        m = pat.match(seg)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def _gate_word_tool(seg: str, known: frozenset[str]) -> str:
+    """证据兜底：段里出现独立成词的已知工具名（键语法损坏时）。"""
+    for t in known:
+        if re.search(r"(?<![A-Za-z0-9_])" + re.escape(t) + r"(?![A-Za-z0-9_])", seg):
+            return t
+    return ""
+
+
+def _gate_expr_end(rest: str, p: int) -> int:
+    """函数表达式残段的结束位置：引号感知扫到匹配的 ')'，扫不到取行尾。"""
+    i = rest.find("(", p)
+    if i == -1:
+        eol = rest.find("\n", p)
+        return eol if eol != -1 else len(rest)
+    depth = 0
+    quote = None
+    j = i
+    n = len(rest)
+    while j < n:
+        ch = rest[j]
+        if quote is not None:
+            if ch == "\\":
+                j += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return j + 1
+        elif ch == "\n" and depth == 0:
+            return j
+        j += 1
+    return n
+
+
+def _gate_loose_block_end(rest: str, p: int) -> int:
+    """无对象的散装残段结束位置：name 行 + 后随的 arguments 前缀行。
+
+    只在两类情况下允许丢弃：a) name 行之后跟着 arguments（含其截断前缀）
+    开头的行——参数区已开始；b) name 行是全文最后一行——流断在调用开头。
+    其他情况（name 行后面是普通正文）返回 -1 不动，避免吞正文。
+    """
+    eol = rest.find("\n", p)
+    if eol == -1:
+        return len(rest)          # b) 截断到全文尾
+    end = eol
+    k = eol + 1
+    while k < len(rest):
+        eol2 = rest.find("\n", k)
+        line = rest[k:eol2 if eol2 != -1 else len(rest)]
+        ls = line.lstrip(" \t")
+        if not ls:
+            break
+        if "arguments:".startswith(ls) or ls.startswith("arguments"):
+            end = eol2 if eol2 != -1 else len(rest)
+            k = end + 1
+            # arguments: 行带出内容（如无大括号的散参数）就到此为止
+            if not ls.startswith("arguments") or len(ls) > len("arguments"):
+                break
+            continue
+        break
+    if end == eol:
+        # name 行后面不是 arguments：仅当其余部分是纯空白（name 行是最后
+        # 一个非空行，流断在调用开头）才丢；有正文则不动
+        if not rest[eol + 1:].strip():
+            return len(rest)
+        return -1
+    return end
 
 
 def _build_tools_system(tools: list[dict[str, Any]]) -> str:
@@ -1242,10 +1677,37 @@ def _parse_tool_calls(
     # <tool_call> 消费掉，放后面做前瞻就没有锚点了。剥法与 _LEAK_RE 统一。
     content = re.sub(r"<tool_callback[^>]*>.*?</tool_callback>", "", content, flags=re.S)
     content = re.sub(r"<tool_callback[^>]*>.*?(?=<tool_call[>\s])", "", content, flags=re.S)
+    # seed 协议块（doubao-seed-evolving 实测 s_20260905_0233_f291）：
+    # <seed:tool_call>\n<function name="shell"><parameter name="command"
+    # string="true">gh api ...</parameter><parameter name="intent"
+    # string="true">...</parameter></function>...\n</seed:tool_call>
+    # 参数值是标签体（命令含引号/反引号都不转义），按 XML 提取而非 JSON。
+    # 未闭合（流截断）剥到全文尾。先于主循环做：调用量计入 calls 后，
+    # 其余兜底的 not calls 门槛自然跳过
+    calls: list[dict[str, Any]] = []
+
+    def _grab_seed_block(m: re.Match) -> str:
+        got_seed = False
+        for fm in re.finditer(
+                r'<function\s+name="([^"]+)"[^>]*>([\s\S]*?)</function>',
+                m.group(1), re.I):
+            args = {pm.group(1): pm.group(2) for pm in re.finditer(
+                r'<parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)</parameter>',
+                fm.group(2), re.I)}
+            calls.append(_mk_tool_call(
+                len(calls), fm.group(1), json.dumps(args, ensure_ascii=False)))
+            got_seed = True
+        if got_seed:
+            return ""
+        # 块里没有完整 function（截断半截）：丢弃壳、留参数文本给闸门判断
+        return m.group(1)
+
+    content = re.sub(
+        r"<seed:tool_call>\s*([\s\S]*?)(?:</seed:tool_call>|\Z)",
+        _grab_seed_block, content, flags=re.I)
     # 记录原文是否带 arg_key/arg_value 残骸：glm-5.3 的坏调用块伴随孤立
     # </arg_value>，这是「这段文本确实是坏掉的调用」而非正文代码示例的强信号
     had_arg_debris = bool(re.search(r"</?\s*arg_(?:key|value)", content))
-    calls: list[dict[str, Any]] = []
     rest_parts: list[str] = []
     pos = 0
     n = len(content)
@@ -1273,23 +1735,22 @@ def _parse_tool_calls(
                 try:
                     obj, end = _TOOL_DECODER.raw_decode(content, j)
                 except ValueError:
-                    raw_end = _find_obj_extent(content, j)
-                    if raw_end != -1:
-                        repaired = _repair_json_quotes(content[j:raw_end])
-                        if repaired:
-                            try:
-                                obj = json.loads(repaired)
-                            except (ValueError, TypeError):
-                                obj = None
-                            if isinstance(obj, dict):
-                                nm = obj.get("name") or obj.get("tool") or ""
-                                ag = obj.get("arguments", obj.get("args", {}))
-                                if not isinstance(ag, dict):
-                                    ag = {"input": ag}
-                                if nm:
-                                    block_calls.append(
-                                        (str(nm), json.dumps(ag, ensure_ascii=False)))
-                                j = raw_end
+                    # 修复段限制在块内（</tool_call> 之前）；块未闭合（流
+                    # 截断）时扩到全文尾，交给截断修复
+                    close = content.find(_TC_CLOSE, j)
+                    seg = content[j:close] if close != -1 else content[j:]
+                    rep = _repair_call_json(seg)
+                    if rep is not None:
+                        obj, rend = rep
+                        if isinstance(obj, dict):
+                            nm = obj.get("name") or obj.get("tool") or ""
+                            ag = obj.get("arguments", obj.get("args", {}))
+                            if not isinstance(ag, dict):
+                                ag = {"input": ag}
+                            if nm:
+                                block_calls.append(
+                                    (str(nm), json.dumps(ag, ensure_ascii=False)))
+                                j = j + rend
                                 continue
                     break
                 name = obj.get("name") or obj.get("tool") or ""
@@ -1316,7 +1777,9 @@ def _parse_tool_calls(
                 expr_consumed = True
                 break
             break  # 既不是 JSON 也不是闭标签：块不合法
-        if closed and block_calls:
+        # closed=正常闭合；j>=n=块内耗尽全文（流截断在块中间）——
+        # 两种情况都要提交已修复出的调用，截断的未闭合块不再整块泄漏
+        if (closed or j >= n) and block_calls:
             for name, args_json in block_calls:
                 calls.append(_mk_tool_call(len(calls), name, args_json))
             pos = j
@@ -1394,26 +1857,40 @@ def _parse_tool_calls(
             try:
                 obj, end = _TOOL_DECODER.raw_decode(rest, js)
             except ValueError:
-                raw_end = _find_obj_extent(rest, js)
-                if raw_end != -1:
-                    repaired = _repair_json_quotes(rest[js:raw_end])
-                    if repaired:
-                        try:
-                            obj = json.loads(repaired)
-                        except (ValueError, TypeError):
-                            obj = None
-                        if obj:
-                            items = obj if isinstance(obj, list) else [obj]
-                            if all(_valid_bare_call_obj(it, known) for it in items):
-                                rest_parts2.append(rest[pos:m.start()].rstrip())
-                                for it in items:
-                                    nm = it.get("name") or it.get("tool") or ""
-                                    ag = _flatten_call_args(it)
-                                    calls.append(_mk_tool_call(
-                                        len(calls), str(nm),
-                                        json.dumps(ag, ensure_ascii=False)))
-                                pos = raw_end
-                                continue
+                rep = _repair_call_json(rest[js:])
+                if rep is not None:
+                    obj, rend = rep
+                    items = obj if isinstance(obj, list) else [obj]
+                    if all(_valid_bare_call_obj(it, known) for it in items):
+                        rest_parts2.append(rest[pos:m.start()].rstrip())
+                        for it in items:
+                            nm = it.get("name") or it.get("tool") or ""
+                            ag = _flatten_call_args(it)
+                            calls.append(_mk_tool_call(
+                                len(calls), str(nm),
+                                json.dumps(ag, ensure_ascii=False)))
+                        pos = js + rend
+                        continue
+                # 修复失败：name 是已知工具 → 丢弃坏原文（实测坏调用整段
+                # 泄进正文纯噪音，agent 侧重试即可）；未知 name 可能是正文
+                # 里的普通 JSON，保留原文
+                peek = _peek_call_name(rest[js:])
+                if peek and peek in known:
+                    rest_parts2.append(rest[pos:m.start()].rstrip())
+                    end_drop = _find_obj_extent(rest, js)
+                    if end_drop == -1:
+                        # 边界不明：有界丢弃——最后一个 } 后的尾巴像正文
+                        # （短、无 JSON 语法字符）则保留，否则吞到文尾防泄漏
+                        seg2 = rest[js:js + 4096]
+                        lb = seg2.rfind("}")
+                        tail2 = rest[js + lb + 1:] if lb != -1 else ""
+                        if lb != -1 and len(tail2) <= 60 and not re.search(
+                                r'[{}\[\]":,]|\\', tail2):
+                            end_drop = js + lb + 1
+                        else:
+                            end_drop = len(rest)
+                    pos = end_drop
+                    continue
                 rest_parts2.append(rest[pos:m.end()])
                 pos = m.end()
                 continue
@@ -1430,6 +1907,34 @@ def _parse_tool_calls(
                 rest_parts2.append(rest[pos:m.end()])
                 pos = m.end()
         rest = "".join(rest_parts2)
+
+    # 兜底 2.5：散装键值形态（deepseek-v4-flash 实测 s_20260902_2130_c8bd）：
+    # name: "shell" 与 arguments: {...} 散装两行。行首 name + 已知工具名 +
+    # arguments: { 的组合在正文里极罕见，误伤风险低
+    if not calls and known_tools:
+        known = frozenset(known_tools)
+        loose_out: list[str] = []
+        lpos = 0
+        for lm in _LOOSE_KV_RE.finditer(rest):
+            if lm.group("name") not in known:
+                continue
+            j = lm.end() - 1  # 指向 arguments 对象的 '{'
+            try:
+                args_obj, lend = _TOOL_DECODER.raw_decode(rest, j)
+            except ValueError:
+                rep = _repair_call_json(rest[j:])
+                if rep is None:
+                    continue
+                args_obj, lend = rep[0], min(j + rep[1], len(rest))
+            if not isinstance(args_obj, dict):
+                continue
+            loose_out.append(rest[lpos:lm.start()])
+            calls.append(_mk_tool_call(
+                len(calls), lm.group("name"),
+                json.dumps(args_obj, ensure_ascii=False)))
+            lpos = lend
+        if lpos:
+            rest = "".join(loose_out) + rest[lpos:]
 
     # 兜底四：裸函数调用表达式（glm-5.3 实测 Scopus 会话变体：
     # web_search(query="...", max_results=7) web_search(...)</arg_value>
@@ -1480,6 +1985,137 @@ def _parse_tool_calls(
         rest = re.sub(r"<think>.*?</think>", "", rest, flags=re.S)
         rest = re.sub(r"</?\s*think>", "", rest)
         rest = rest.strip()
+
+    # 泄漏闸门（最后一道防线）：所有解析与修复都跑完后，残文里仍有
+    # 「调用语法证据 + 已知工具名」的段——说明出现了未知的退化变体或
+    # 修复全失败。先给合法对象最后一次补收机会（兜底二/2.5 在已有
+    # calls 时不再跑，混合流里后续裸调用会漏到这里）；补收不了则丢弃
+    # 该段（坏调用原文对下游是纯噪音，agent 下一轮重试即可），保住前后
+    # 正文，并打 WARN——新变体从 proxy.log 搜 [toolcall-gate] 即可自动
+    # 发现，不用等用户在聊天里撞见。
+    if known_tools:
+        known = frozenset(known_tools)
+        # 先剥掉孤立 tool_call 标签壳（含损坏形态：开标签断 > 、只剩
+        # 半截的），否则「JSON 已被兜底收走、壳留在正文」照样是泄漏。
+        # 放在所有兜底之后，不影响 <tool_call> 块的正常解析
+        rest = re.sub(r"</?\s*tool_call\b[^>\n]{0,40}>?", "", rest)
+        tools_alt = "|".join(sorted((re.escape(t) for t in known), key=len, reverse=True))
+        # 候选开头：行首（裸 JSON / 散装 name: / 引号键散装 / 标签族 /
+        # 函数表达式）+ 行内强证据（正文与调用连写无换行：必须工具名与
+        # arguments 键/参数赋值同现，防止误伤正文里恰好提到工具名的句子）
+        gate_re = re.compile(
+            r'(?m)^[ \t]*(?:'
+            r'\{[\s]*"?name"?[ \t]*:[ \t]*"'
+            r'|\{(?=[^\n]{0,80}"arguments")'
+            r'|\{[\s]*"name"(?=[^\n]{0,100}(?:' + tools_alt + r'))'
+            r'|name"?[ \t]*:[ \t]*"'
+            r'|"(?:name|tool)"?[ \t]*:[ \t]*"'
+            r'|</?\s*t(?:ool_action|ool_name|ool_callback|ool_call)[>\s]'
+            r'|(?P<fnl>[A-Za-z_][\w.]*)[ \t]*\('
+            r')'
+            r'|\{\s*"?name"?\s*:[ \t]*"(?:' + tools_alt + r')"[^\n]{0,200}?"arguments"'
+            r'|name"?\s*:[ \t]*"(?:' + tools_alt + r')"[ \t\r\n]*,?[ \t\r\n]*arguments\s*:'
+            r'|\b(?P<fni>(?:' + tools_alt + r'))[ \t]*\([ \t]{0,40}[A-Za-z_]\w*[ \t]*=')
+        gate_out: list[str] = []
+        gpos = 0
+        touched = False
+        for gm in gate_re.finditer(rest):
+            p = gm.start()
+            if p < gpos:
+                continue
+            seg = rest[p:p + 512]
+            fnm = gm.group("fnl") or gm.group("fni")
+            if fnm:
+                nm = fnm
+                if nm not in known:
+                    continue
+                # 表达式：引号感知扫到行内匹配的 ')'，扫不到取行尾
+                end = _gate_expr_end(rest, p)
+                # 打捞机会：完整键值参数表达式直接收成调用
+                exprs = _find_call_exprs(rest[p:end], known)
+                if exprs:
+                    gate_out.append(rest[gpos:p])
+                    for name, args, _s2, _e2 in exprs:
+                        calls.append(_mk_tool_call(
+                            len(calls), name, json.dumps(args, ensure_ascii=False)))
+                    gpos = end
+                    touched = True
+                    continue
+            else:
+                nm = _gate_tool_name(seg) or _gate_word_tool(seg, known)
+                if not nm or nm not in known:
+                    continue
+                b = seg.find("{")
+                if b == -1:
+                    # 无对象：散装截断（name 行后面 arguments 还没来/坏了）。
+                    # 只在「后随 arguments 前缀行」或「name 行已是全文最后一
+                    # 行」（流截断）时才丢，避免吞正文里提到工具名的 YAML
+                    end = _gate_loose_block_end(rest, p)
+                    if end == -1:
+                        continue
+                else:
+                    b_abs = p + b
+                    e = _find_obj_extent(rest, b_abs)
+                    end = e if e != -1 else len(rest)
+                    # 补收机会：对象完整且能解码 → 直接收成调用。
+                    # 对象本身带 name 键 = 裸 JSON 本体；不带 = 散装 kv 的
+                    # arguments 对象（外层 { 被删的实测变体）。
+                    # extent 找不到（结构引号双损）或解码失败 → 修复管线
+                    # 再试一次（截断尾流实测能打捞出完整调用）
+                    obj = None
+                    if e != -1:
+                        try:
+                            cand, _ = _TOOL_DECODER.raw_decode(rest, b_abs)
+                            obj = cand if isinstance(cand, dict) else None
+                        except ValueError:
+                            rep = _repair_call_json(rest[b_abs:e])
+                            if rep is not None and isinstance(rep[0], dict):
+                                obj = rep[0]
+                    else:
+                        # 边界不明（结构/引号双损）：有界丢弃——到段内最后
+                        # 一个 } 为止，且其后的尾巴要像正文（短、无 JSON
+                        # 语法）才保留，否则吞到文尾防泄漏
+                        last_b = seg.rfind("}")
+                        tail = rest[p + last_b + 1:] if last_b != -1 else ""
+                        if last_b != -1 and len(tail) <= 60 and not re.search(
+                                r'[{}\[\]":,]|\\', tail):
+                            end = p + last_b + 1
+                        else:
+                            end = len(rest)
+                        rep = _repair_call_json(rest[b_abs:end])
+                        if rep is not None and isinstance(rep[0], dict) and (
+                                rep[0].get("name") or rep[0].get("tool")
+                                or any(k2 not in ("name", "tool") for k2 in rep[0])):
+                            obj = rep[0]
+                    if obj is not None:
+                        call_nm = str(obj.get("name") or obj.get("tool") or nm)
+                        if call_nm in known:
+                            # 证据已足够强（调用开头 + 已知工具名 + 可解析对象），
+                            # 放宽杂键限制——收回比丢弃/泄漏都好
+                            ag = _flatten_call_args(obj) if obj.get("name") or obj.get("tool") else obj
+                            calls.append(_mk_tool_call(
+                                len(calls), call_nm, json.dumps(ag, ensure_ascii=False)))
+                        gate_out.append(rest[gpos:p])
+                        gpos = end
+                        touched = True
+                        continue
+                    if e == -1:
+                        # 修不动且边界不明：有界丢弃——到段内最后一个 } 或
+                        # " 为止，绝不吞后面的正文
+                        last_b = max(seg.rfind("}"), seg.rfind('"'))
+                        end = p + last_b + 1 if last_b != -1 else min(p + 256, len(rest))
+            gate_out.append(rest[gpos:p])
+            gpos = end
+            touched = True
+            log.warning(
+                "[toolcall-gate] 丢弃无法解析的调用残段 tool=%s len=%d 片段=%r",
+                nm, end - p, rest[p:p + 80])
+        if touched:
+            gate_out.append(rest[gpos:])
+            rest = "".join(gate_out)
+            # 丢弃后留下的孤立标签壳 / 参数残骸一并清掉
+            rest = re.sub(r"</?\s*(?:tool_call|tool_callback|tool_action"
+                          r"|tool_name|arg_key|arg_value)[^>]*>", "", rest)
 
     return rest.strip(), calls
 
