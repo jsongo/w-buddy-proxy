@@ -1700,11 +1700,12 @@ def _send_trae_work_chat(
     # 上游断流多为瞬态（实测：长响应读到一半连接被关 → http.client.IncompleteRead，
     # 曾被流式层当正文吐成 "[Error: IncompleteRead(...)]"）。读失败后丢弃半截响应，
     # 同端点退避重试，避免一次网络抖动作废整轮长生成。
+    payload = json.dumps(body).encode("utf-8")
     last_error: Exception | None = None
     for attempt in range(1, _WORK_CHAT_MAX_ATTEMPTS + 1):
         req = urllib.request.Request(
             url,
-            data=json.dumps(body).encode("utf-8"),
+            data=payload,
             headers=headers,
             method="POST",
         )
