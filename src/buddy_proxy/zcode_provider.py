@@ -53,11 +53,22 @@ BIGMODEL_ANTHROPIC_BASE = "https://open.bigmodel.cn/api/anthropic"
 ZAI_ANTHROPIC_BASE = "https://api.z.ai/api/anthropic"
 BIGMODEL_OPENAI_BASE = "https://open.bigmodel.cn/api/paas/v4"
 
-# 与 ZCode CLI 内置模型表一致（~/.zcode/v2/config.json）
+# 与 ZCode CLI 内置模型表一致（~/.zcode/v2/config.json）。
+# id 用**小写**（与全站 models_config.json / Claude Code 侧配置一致），
+# 这样 forward_chat 的「自动匹配 provider.models()」能命中 zcode，
+# 不至于让 glm-* 请求错误落到 codebuddy 兜底通道。
 DEFAULT_MODELS: dict[str, str] = {
-    "GLM-5.3": "GLM-5.3 (thinking, 1M ctx)",
-    "GLM-5.3-Flash": "GLM-5.3-Flash (thinking, multimodal, 1M ctx)",
+    "glm-5.3": "GLM-5.3 (thinking, 1M ctx)",
+    "glm-5.3-flash": "GLM-5.3-Flash (thinking, multimodal, 1M ctx)",
     "glm-5-turbo": "GLM-5-Turbo (200K ctx)",
+}
+
+# 小写 id → 上游正式模型名（ZCode/智谱侧的大小写字面量）。
+# anthropic 直通时若上游对 model 名大小写敏感，用它归一化后再转发。
+MODEL_NAME_CANONICAL: dict[str, str] = {
+    "glm-5.3": "GLM-5.3",
+    "glm-5.3-flash": "GLM-5.3-Flash",
+    "glm-5-turbo": "glm-5-turbo",
 }
 
 _TIMEOUT = httpx.Timeout(connect=15.0, read=600.0, write=60.0, pool=15.0)
@@ -225,7 +236,9 @@ class ZcodeProvider(BaseProvider):
             source = original if isinstance(original, dict) and original else body
             upstream_body = {k: v for k, v in source.items() if not k.startswith("_")}
             if isinstance(original, dict) and original and body.get("model"):
-                upstream_body["model"] = body["model"]
+                # 路由层可能剥过 "zcode/" 前缀/归一化过大小写，这里统一映射回
+                # 上游正式模型名（如 glm-5.3 → GLM-5.3，ZCode CLI 验证过的格式）
+                upstream_body["model"] = MODEL_NAME_CANONICAL.get(body["model"], body["model"])
             url = f"{self._base}/v1/messages"
             headers = _auth_headers(self._api_key, {"Accept": "text/event-stream"})
         else:

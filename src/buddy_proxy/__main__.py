@@ -108,8 +108,25 @@ def main():
     if args.login:
         client.login(open_browser=not args.no_browser)
 
-    # 初始化额外 provider（豆包/Trae 等）
+    # 初始化额外 provider（ZCode/豆包/Trae 等）
     providers: dict[str, BaseProvider] = {}
+    # ⚠️ zcode 必须**最先**注册：trae 的 T1 tier 也提供 glm-5.3 / glm-5.3-flash
+    # （小写 id），若 trae 先注册，forward_chat 自动匹配会先命中 trae，glm-*
+    # 请求就落不到 zcode coding-plan 通道。providers dict 按插入序遍历匹配。
+    if args.zcode:
+        from buddy_proxy.zcode_provider import ZcodeProvider
+
+        zcode = ZcodeProvider()
+        try:
+            zcode.ensure_auth()  # 启动时校验凭证，给出清晰的配置提示
+        except HTTPException as exc:
+            logger.warning("zcode provider 认证未就绪: %s", exc.detail)
+        providers[zcode.id] = zcode
+        logger.info("Zcode provider enabled (%s)", zcode.health().get("base_url"))
+        print("[Zcode] Enabled (BigModel GLM)")
+    else:
+        print("[Zcode] Disabled (pass --zcode or ZCODE_ENABLED=1 to enable)")
+
     if args.doubao:
         doubao = DoubaoProvider()
         providers[doubao.id] = doubao
@@ -127,20 +144,6 @@ def main():
         print("[Trae] Enabled")
     else:
         print("[Trae] Disabled (pass --trae or TRAE_ENABLED=1 to enable)")
-
-    if args.zcode:
-        from buddy_proxy.zcode_provider import ZcodeProvider
-
-        zcode = ZcodeProvider()
-        try:
-            zcode.ensure_auth()  # 启动时校验凭证，给出清晰的配置提示
-        except HTTPException as exc:
-            logger.warning("zcode provider 认证未就绪: %s", exc.detail)
-        providers[zcode.id] = zcode
-        logger.info("Zcode provider enabled (%s)", zcode.health().get("base_url"))
-        print("[Zcode] Enabled (BigModel GLM)")
-    else:
-        print("[Zcode] Disabled (pass --zcode or ZCODE_ENABLED=1 to enable)")
 
     # 校验兜底通道：必须是 codebuddy 或已启用的 provider id
     if args.default_provider != "codebuddy" and args.default_provider not in providers:
