@@ -182,6 +182,28 @@ def test_nonstream_convert_tool_calls():
     }]
 
 
+def test_nonstream_convert_tool_calls_with_null_content():
+    """上游纯 tool_calls 响应带 content: null（OpenAI 系惯例）不应崩溃。"""
+    data = {
+        "choices": [{"message": {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "get_weather",
+                             "arguments": '{"city": "北京"}'},
+            }],
+        }}],
+    }
+    msg = chat_completion_to_anthropic_message(data)
+    assert msg["stop_reason"] == "tool_use"
+    assert msg["content"] == [{
+        "type": "tool_use", "id": "call_1",
+        "name": "get_weather", "input": {"city": "北京"},
+    }]
+    assert not any(b.get("type") == "text" for b in msg["content"])
+
+
 def test_think_split_only_leading():
     """正文中段的 <think> 不拆（避免误伤举例文本）。"""
     from buddy_proxy.anthropic_adapter import _split_leading_think
@@ -227,6 +249,23 @@ def test_stream_converter_thinking_blocks():
     delta = [d for n, d in events if n == "message_delta"][0]
     assert delta["delta"]["stop_reason"] == "end_turn"
     assert names[-1] == "message_stop"
+
+
+def test_stream_converter_usage_includes_input_tokens():
+    """finish() 的 message_delta usage 应同时带 input_tokens 与 output_tokens。"""
+    conv = AnthropicStreamConverter("glm-5.2")
+    events = []
+    for chunk in (
+        {"choices": [{"delta": {"content": "答案"}}]},
+        {"choices": [{"delta": {}, "finish_reason": "stop"}],
+         "usage": {"prompt_tokens": 15, "completion_tokens": 8, "total_tokens": 23}},
+    ):
+        events.extend(conv.feed_chunk(chunk))
+    events.extend(conv.finish())
+
+    delta = [d for n, d in events if n == "message_delta"][0]
+    assert delta["usage"]["input_tokens"] == 15
+    assert delta["usage"]["output_tokens"] == 8
 
 
 # ---------------------------------------------------------------------------

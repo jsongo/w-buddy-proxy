@@ -444,10 +444,11 @@ class AnthropicStreamConverter:
         stop_reason = stop_reason_map.get(self.finish_reason or "stop", "end_turn")
         
         # 映射usage
-        usage_delta = {"output_tokens": 0}
+        usage_delta = {"input_tokens": 0, "output_tokens": 0}
         if self.usage:
-            # Chat使用completion_tokens，Anthropic使用output_tokens
+            # Chat使用completion_tokens/prompt_tokens，Anthropic使用output_tokens/input_tokens
             usage_delta["output_tokens"] = self.usage.get("completion_tokens", 0)
+            usage_delta["input_tokens"] = self.usage.get("prompt_tokens", 0)
         
         # 发出message_delta
         events.append(("message_delta", {
@@ -499,7 +500,7 @@ def chat_completion_to_anthropic_message(
     """
     choice = (data.get("choices") or [{}])[0]
     message = choice.get("message") or {}
-    content = message.get("content", "")
+    content = message.get("content") or ""
 
     thinking, text = _split_leading_think(content)
 
