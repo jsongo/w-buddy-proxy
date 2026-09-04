@@ -1220,35 +1220,45 @@ def _extract_prompt(
     tools_taught = False
     teaching = _build_tools_system(tools) if tools else ""
 
+    def _content_parts(content: Any) -> list[dict[str, Any]]:
+        """OpenAI content -> Trae block 数组，保留 image_url 等多模态 block。
+
+        上游 llm_utils_chat 认 OpenAI 风格的 image_url block（data URL 实测
+        glm-5.3-flash 能读图），此前把 content 拍平成纯文本导致图片被静默
+        丢弃、模型回答"没有看到图片"。
+        """
+        if isinstance(content, str):
+            return [{"type": "text", "text": content}]
+        parts: list[dict[str, Any]] = []
+        if isinstance(content, list):
+            for p in content:
+                if not isinstance(p, dict):
+                    continue
+                ptype = p.get("type")
+                if ptype == "text":
+                    if p.get("text"):
+                        parts.append({"type": "text", "text": p.get("text", "")})
+                elif ptype == "image_url":
+                    iu = p.get("image_url")
+                    url = iu.get("url") if isinstance(iu, dict) else iu
+                    if url:
+                        parts.append({"type": "image_url", "image_url": {"url": url}})
+        return parts or [{"type": "text", "text": ""}]
+
     for m in messages:
         role = m.get("role", "user")
         content = m.get("content", "")
-        if isinstance(content, str):
-            text = content
-        elif isinstance(content, list):
-            text = "".join(
-                p.get("text", "") for p in content
-                if isinstance(p, dict) and p.get("type") == "text"
-            )
-        else:
-            text = ""
-
-        tool_calls = m.get("tool_calls") if isinstance(m, dict) else None
-        if role == "assistant" and tool_calls:
-            # 上游不认 tool_calls 字段：序列化成教学格式的调用块拼进正文
-            if text:
-                text = text + "\n" + _serialize_tool_calls(tool_calls)
-            else:
-                text = _serialize_tool_calls(tool_calls)
-        elif role in ("tool", "function"):
-            # 工具结果消息：转 user 角色 + [tool_result] 前缀（上游无此角色概念）
-            name = m.get("name") or (
-                (m.get("tool_call_id") and "") or "tool"
-            )
-            text = f"[tool_result | {name}]\n{text}"
-            role = "user"
 
         if role == "system" and not guard_merged:
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = "".join(
+                    p.get("text", "") for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+            else:
+                text = ""
             merged = text
             if guard:
                 merged = _AGENT_GUARD + "\n\n" + merged
@@ -1258,7 +1268,24 @@ def _extract_prompt(
             out.append({"role": "system", "content": [{"type": "text", "text": merged}]})
             guard_merged = True
             continue
-        out.append({"role": role, "content": [{"type": "text", "text": text}]})
+
+        parts = _content_parts(content)
+        text = "".join(p["text"] for p in parts if p["type"] == "text")
+
+        tool_calls = m.get("tool_calls") if isinstance(m, dict) else None
+        if role == "assistant" and tool_calls:
+            # 上游不认 tool_calls 字段：序列化成教学格式的调用块拼进正文
+            block = _serialize_tool_calls(tool_calls)
+            parts.append({"type": "text", "text": ("\n" + block) if text else block})
+        elif role in ("tool", "function"):
+            # 工具结果消息：转 user 角色 + [tool_result] 前缀（上游无此角色概念）
+            name = m.get("name") or (
+                (m.get("tool_call_id") and "") or "tool"
+            )
+            parts.insert(0, {"type": "text", "text": f"[tool_result | {name}]\n"})
+            role = "user"
+
+        out.append({"role": role, "content": parts})
 
     if guard and not guard_merged:
         out.insert(0, {
