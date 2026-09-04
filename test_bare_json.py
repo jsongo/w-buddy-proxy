@@ -142,6 +142,97 @@ for p in ['查一下。\n', '\x3ctool_call na', 'me="shell" comm', 'and="pwd" in
 tail, calls = sp.flush()
 check("XML属性: 流式跨chunk", "".join(out) == "查一下。\n" and len(calls) == 1)
 
+# 20. 未转义双引号修复：单个裸 JSON（deepseek-v4-pro 实测 echo "---"）
+bad_q = '{ "name": "shell", "arguments": { "command": "ls 2>/dev/null; echo "---"; ls | grep diff", "intent": "查diff" } }'
+rest, calls = _parse_tool_calls(bad_q, KNOWN)
+check("引号修复: 单个裸JSON", len(calls) == 1 and calls[0]["function"]["name"] == "shell")
+if calls:
+    aq = json.loads(calls[0]["function"]["arguments"])
+    check("引号修复: 命令保留", 'echo "---"' in aq.get("command", ""))
+
+# 21. 未转义双引号修复：{ 和 "name" 之间有空格
+bad_sp = '{ "name": "shell", "arguments": { "command": "echo "hi"", "intent": "test" } }'
+rest, calls = _parse_tool_calls(bad_sp, KNOWN)
+check("引号修复: 空格形态", len(calls) == 1)
+
+# 22. 未转义双引号修复：同行连续多个
+bad_multi = (
+    '{"name": "shell", "arguments": {"command": "echo "PR1" && ls", "intent": "PR1"}} '
+    '{"name": "shell", "arguments": {"command": "echo "PR2" && ls", "intent": "PR2"}}'
+)
+rest, calls = _parse_tool_calls(bad_multi, KNOWN)
+check("引号修复: 同行连续2个", len(calls) == 2, f"calls={len(calls)}")
+
+# 23. 未转义双引号修复：<tool_call> 包裹
+bad_wrapped = '<tool_call>\n{"name": "shell", "arguments": {"command": "echo "hello" && ls"}}\n</tool_call>'
+rest, calls = _parse_tool_calls(bad_wrapped, KNOWN)
+check("引号修复: tool_call包裹", len(calls) == 1)
+
+# 24. 未转义双引号修复：流式路径
+sp = _StreamToolCallSplitter(KNOWN)
+out = []
+full = '查一下。\n' + bad_q
+for k in range(0, len(full), 25):
+    out.append(sp.feed(full[k:k+25]))
+tail, calls = sp.flush()
+tail2, calls2 = _parse_tool_calls(tail, KNOWN)
+check("引号修复: 流式", len(calls) + len(calls2) == 1 and "shell" not in "".join(out))
+
+# 25. 正常 JSON 不被误修
+good = '{"name": "shell", "arguments": {"command": "ls -la", "intent": "列目录"}}'
+rest, calls = _parse_tool_calls(good, KNOWN)
+check("引号修复: 正常JSON不变", len(calls) == 1 and rest == "")
+if calls:
+    ag = json.loads(calls[0]["function"]["arguments"])
+    check("引号修复: 正常参数", ag["command"] == "ls -la")
+
+# 26. 值里含 } （echo "}"）：扫描器跟踪字符串状态，边界不能提前归零
+brace_v = '{ "name": "shell", "arguments": { "command": "echo "}" 2>/dev/null; ls", "intent": "查" } }'
+rest, calls = _parse_tool_calls(brace_v, KNOWN)
+check("引号修复: 值含}解析出调用", len(calls) == 1, f"calls={len(calls)} rest={rest!r}")
+if calls:
+    ab = json.loads(calls[0]["function"]["arguments"])
+    check("引号修复: 值含}命令完整", ab.get("command") == 'echo "}" 2>/dev/null; ls', f"args={ab}")
+
+# 27. 彻底破碎、无法定位边界：优雅降级（不崩溃、不误修、正文保留）
+broken = '{"name": "shell", "arguments": {"command": "ls 未闭合'
+rest, calls = _parse_tool_calls(broken, KNOWN)
+check("引号修复: 不可修复降级保留", len(calls) == 0 and "未闭合" in rest, f"rest={rest!r}")
+
+# 28. 冒号连写形态（glm-5.3 实测）：web_searchquery: <自由文本>，
+#     连续两个时上一个值与下一个标记粘连，尾随 markdown --- 分隔线
+WS = frozenset({"web_search", "web_fetch"})
+colon = ("web_searchquery: how to identify if underlying model is Claude "
+         "fingerprint methodsweb_searchquery: 检测套壳模型是否 Claude 方法 提示词探针\n---")
+rest, calls = _parse_tool_calls(colon, WS)
+check("冒号连写: 解析2个", len(calls) == 2, f"n={len(calls)} rest={rest!r}")
+if len(calls) == 2:
+    c0 = json.loads(calls[0]["function"]["arguments"])
+    c1 = json.loads(calls[1]["function"]["arguments"])
+    check("冒号连写: q1完整", c0.get("query", "").endswith("methods") and "how to identify" in c0["query"])
+    check("冒号连写: q2完整", c1.get("query") == "检测套壳模型是否 Claude 方法 提示词探针")
+check("冒号连写: 无残骸", "web_search" not in rest and "---" not in rest, f"rest={rest!r}")
+
+# 29. 冒号连写：单个 + 前导正文
+colon2 = "我来搜一下。\nweb_searchquery: claude fingerprint 检测方法"
+rest, calls = _parse_tool_calls(colon2, WS)
+check("冒号连写: 前导正文", len(calls) == 1 and "我来搜" in rest, f"n={len(calls)} rest={rest!r}")
+
+# 30. 冒号连写：流式跨 chunk
+sp = _StreamToolCallSplitter(WS)
+out = []
+for k in range(0, len(colon), 20):
+    out.append(sp.feed(colon[k:k + 20]))
+tail, calls = sp.flush()
+t2, calls2 = _parse_tool_calls(tail, WS)
+check("冒号连写: 流式无泄漏", len(calls) + len(calls2) == 2
+      and "web_search" not in "".join(out), f"n={len(calls) + len(calls2)} out={''.join(out)!r}")
+
+# 31. 冒号连写：普通正文（工具名后有空格再跟冒号）不误伤
+prose = "web_search 是一个工具: query 参数必填。"
+rest, calls = _parse_tool_calls(prose, WS)
+check("冒号连写: 正文不误伤", len(calls) == 0 and "工具" in rest, f"rest={rest!r}")
+
 print()
 print("RESULT:", "ALL PASS" if not fails else f"FAILED: {fails}")
 sys.exit(1 if fails else 0)

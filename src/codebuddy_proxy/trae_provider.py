@@ -558,8 +558,9 @@ _TOOL_STREAM_TAGS = ("tool_call", "tool_calls", "tool_action", "tool_name", "too
 
 # 裸 JSON 工具调用候选前缀：模型偶尔省略标签，直接在行首输出
 # {"name": ...} 或 [{"name": ...}]（数组包多个调用）
-_BARE_CANDS = ('{"name"', '[{"name"')
-_BARE_RE = re.compile(r'(?m)^[ \t]*(\[\{"name"|\{"name")')
+# deepseek-v4-pro 偶尔在 { 和 " 之间加空格：{ "name": ... }
+_BARE_CANDS = ('{"name"', '{ "name"', '[{"name"', '[{ "name"', '[ {"name"')
+_BARE_RE = re.compile(r'(?m)^[ \t]*(\[\s*\{\s*"name"|\{\s*"name")')
 
 # XML 属性风格工具调用：<tool_call name="..." command="..." />
 # 属性值里可能含 '>'（如 shell 命令 2>/dev/null），不能用简单正则匹配整标签，
@@ -653,6 +654,66 @@ def _find_call_exprs(
                 args = {"input": body.strip()}
             results.append((name, args, m.start(), end + 1))
         pos = end + 1
+    return results
+
+
+def _colon_marker_re(tools: frozenset[str] | set[str], anchored: bool = True) -> re.Pattern:
+    """glm-5.3 连写变体「工具名+参数名+冒号」的起始标记正则。
+
+    模型省略括号/引号/等号，输出 web_searchquery: <自由文本>；工具名与
+    参数名之间无空格。按工具名长度降序拼接分支避免前缀撞名。
+    anchored=True 时首个标记必须在行首；连续调用时下一个标记会与
+    上一个值粘连（methodsweb_searchquery:），用 anchored=False 续扫。
+    命名捕获组：tool=工具名，param=参数名。
+    """
+    alt = "|".join(
+        sorted((re.escape(t) for t in tools), key=len, reverse=True))
+    body = rf"(?P<tool>(?:{alt}))(?P<param>[a-z_][a-z0-9_]*)\s*:"
+    if anchored:
+        return re.compile(rf"(?m)^[ \t]*{body}")
+    return re.compile(body)
+
+
+def _find_colon_joined_calls(
+    text: str,
+    tools: frozenset[str] | set[str],
+) -> list[tuple[str, dict[str, Any], int, int]]:
+    """解析 web_searchquery: <自由文本> 连写形态的工具调用。
+
+    glm-5.3 实测：模型连括号都省掉，直接写
+    ``web_searchquery: how to ... methodsweb_searchquery: 检测套壳...``
+    （连续多个时上一个值直接拼到下一个标记前，无分隔符）。
+    首个标记必须位于行首；后续标记由上一个值的结束边界界定。
+    返回 [(name, args_dict, start, end), ...]，end 为值结束位置。
+    """
+    first = _colon_marker_re(tools).search(text)
+    if not first:
+        return []
+    marks = [first]
+    follow_re = _colon_marker_re(tools, anchored=False)
+    while True:
+        m2 = follow_re.search(text, marks[-1].end())
+        if not m2:
+            break
+        marks.append(m2)
+    results: list[tuple[str, dict[str, Any], int, int]] = []
+    n = len(text)
+    for i, mk in enumerate(marks):
+        val_start = mk.end()
+        val_end = marks[i + 1].start() if i + 1 < len(marks) else n
+        value = text[val_start:val_end]
+        # 去掉值末尾的 markdown 水平分隔线行（如模型另起一行写的 ---）
+        value = re.sub(r"(?m)^[ \t]*-{3,}[ \t]*$", "", value)
+        # 自由文本压成单行
+        value = re.sub(r"\s+", " ", value).strip(" \t\r\n-")
+        if not value:
+            continue
+        results.append((
+            mk.group("tool"),
+            {mk.group("param"): value},
+            mk.start("tool"),
+            val_end,
+        ))
     return results
 
 
@@ -770,6 +831,118 @@ def _flatten_call_args(obj: dict[str, Any]) -> dict[str, Any]:
     return args if isinstance(args, dict) else {"input": args}
 
 
+def _quote_is_close(s: str, i: int) -> bool:
+    """Heuristic: does the ``"`` at position *i* close the current string?
+
+    Tolerates unescaped quotes inside values (deepseek v4 pro leak): a quote
+    followed by ``}`` / ``]`` only closes when valid structure tokens follow
+    the bracket — a ``}`` immediately followed by more string content
+    (e.g. ``echo "}" && ls``) is an inner quote, not the end of the value.
+    """
+    n = len(s)
+    j = i + 1
+    while j < n and s[j] in " \t":
+        j += 1
+    if j >= n:
+        return True
+    c = s[j]
+    if c in ":,\n":
+        return True
+    if c in "}]":
+        k = j + 1
+        while k < n and s[k] in " \t\r\n":
+            k += 1
+        if k >= n or s[k] in ",}]\n":
+            return True
+        return False
+    return False
+
+
+def _find_obj_extent(text: str, start: int) -> int:
+    """Best-effort brace-depth scan to find the end of a JSON object.
+
+    Returns the index *after* the matching ``}`` or -1 if unbalanced.
+    Tracks string state with :func:`_quote_is_close` so stray braces inside
+    broken string values (e.g. ``"command": "echo "}" && ls"``) don't
+    prematurely zero the depth.  If the boundary still can't be found the
+    caller degrades gracefully (no repair, raw text preserved).
+    """
+    if start >= len(text) or text[start] != "{":
+        return -1
+    depth = 0
+    in_string = False
+    i = start
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch == '"':
+            if not in_string:
+                in_string = True
+            elif _quote_is_close(text, i):
+                in_string = False
+            i += 1
+            continue
+        if not in_string:
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return i + 1
+        i += 1
+    return -1
+
+
+def _repair_json_quotes(s: str) -> str | None:
+    """Try to fix unescaped double-quotes inside JSON string values.
+
+    DeepSeek v4 pro occasionally emits shell commands with unescaped ``"``
+    (e.g. ``echo "---"``), which makes the JSON invalid.  Walk through the
+    text tracking string-state; quotes that don't look like a real string
+    close (per :func:`_quote_is_close`) are escaped in place.
+
+    Returns the repaired string, or *None* if no repair was applied or the
+    input doesn't look like a JSON object/array.
+    """
+    stripped = s.lstrip()
+    if not stripped or stripped[0] not in "{[":
+        return None
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    in_string = False
+    repaired_any = False
+    while i < n:
+        ch = s[i]
+        if not in_string:
+            out.append(ch)
+            if ch == '"':
+                in_string = True
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            out.append(s[i : i + 2])
+            i += 2
+            continue
+        if ch == '"':
+            if _quote_is_close(s, i):
+                out.append(ch)
+                in_string = False
+            else:
+                out.append('\\"')
+                repaired_any = True
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    if not repaired_any:
+        return None
+    return "".join(out)
+
+
 class _StreamToolCallSplitter:
     """流式工具调用切分器：正文按 chunk 透传，工具调用块整段扣留。
 
@@ -858,6 +1031,35 @@ class _StreamToolCallSplitter:
                     best = p
         return best
 
+    def _colon_pos(self, buf: str) -> int:
+        """行首冒号连写调用的扣留位置（glm-5.3 web_searchquery: 变体）。
+
+        完整标记 web_searchquery: 直接正则定位；跨 chunk 分裂的前缀
+        （web_searchqu / web_searchquery / web_searchquery:）用尾行
+        前缀匹配扣住。
+        """
+        if not self._tools:
+            return -1
+        if not hasattr(self, "_colon_re"):
+            self._colon_re = _colon_marker_re(self._tools)
+        best = -1
+        m = self._colon_re.search(buf)
+        if m:
+            best = m.start("tool")
+        last_nl = buf.rfind("\n")
+        line = buf[last_nl + 1:]
+        ls = line.lstrip()
+        if ls:
+            for t in self._tools:
+                if ls.startswith(t):
+                    tail = ls[len(t):]
+                    if tail and re.fullmatch(r"[a-z0-9_]*:?", tail):
+                        p = last_nl + 1 + (len(line) - len(ls))
+                        if best == -1 or p < best:
+                            best = p
+                        break
+        return best
+
     def feed(self, text: str) -> str:
         self._buf += text
         pos = self._first_tag_pos(self._buf)
@@ -868,6 +1070,9 @@ class _StreamToolCallSplitter:
             ep = self._call_expr_pos(self._buf)
             if ep != -1 and (pos == -1 or ep < pos):
                 pos = ep
+            cp = self._colon_pos(self._buf)
+            if cp != -1 and (pos == -1 or cp < pos):
+                pos = cp
         if pos == -1:
             safe, self._buf = self._buf, ""
         else:
@@ -1042,6 +1247,24 @@ def _parse_tool_calls(
                 try:
                     obj, end = _TOOL_DECODER.raw_decode(content, j)
                 except ValueError:
+                    raw_end = _find_obj_extent(content, j)
+                    if raw_end != -1:
+                        repaired = _repair_json_quotes(content[j:raw_end])
+                        if repaired:
+                            try:
+                                obj = json.loads(repaired)
+                            except (ValueError, TypeError):
+                                obj = None
+                            if isinstance(obj, dict):
+                                nm = obj.get("name") or obj.get("tool") or ""
+                                ag = obj.get("arguments", obj.get("args", {}))
+                                if not isinstance(ag, dict):
+                                    ag = {"input": ag}
+                                if nm:
+                                    block_calls.append(
+                                        (str(nm), json.dumps(ag, ensure_ascii=False)))
+                                j = raw_end
+                                continue
                     break
                 name = obj.get("name") or obj.get("tool") or ""
                 args = obj.get("arguments", obj.get("args", {}))
@@ -1131,6 +1354,9 @@ def _parse_tool_calls(
     # 兜底二：无标签裸 JSON（仅 agent 请求、且前两种格式都没解析出调用）
     if not calls and known_tools:
         known = frozenset(known_tools)
+        # 同一行连续多个裸 JSON（deepseek-v4-pro 实测）：在 } {"name" 边界
+        # 插入换行，使后续对象也能被 _BARE_RE 的行首锚点匹配到
+        rest = re.sub(r'}\s+(?=\{\s*"name")', '}\n', rest)
         rest_parts2: list[str] = []
         pos = 0
         while True:
@@ -1142,6 +1368,26 @@ def _parse_tool_calls(
             try:
                 obj, end = _TOOL_DECODER.raw_decode(rest, js)
             except ValueError:
+                raw_end = _find_obj_extent(rest, js)
+                if raw_end != -1:
+                    repaired = _repair_json_quotes(rest[js:raw_end])
+                    if repaired:
+                        try:
+                            obj = json.loads(repaired)
+                        except (ValueError, TypeError):
+                            obj = None
+                        if obj:
+                            items = obj if isinstance(obj, list) else [obj]
+                            if all(_valid_bare_call_obj(it, known) for it in items):
+                                rest_parts2.append(rest[pos:m.start()].rstrip())
+                                for it in items:
+                                    nm = it.get("name") or it.get("tool") or ""
+                                    ag = _flatten_call_args(it)
+                                    calls.append(_mk_tool_call(
+                                        len(calls), str(nm),
+                                        json.dumps(ag, ensure_ascii=False)))
+                                pos = raw_end
+                                continue
                 rest_parts2.append(rest[pos:m.end()])
                 pos = m.end()
                 continue
@@ -1183,6 +1429,24 @@ def _parse_tool_calls(
                 pos3 = e
             out.append(rest[pos3:])
             rest = "".join(out)
+
+    # 兜底五：冒号连写形态（glm-5.3 实测：web_searchquery: <自由文本>，
+    # 模型省略括号/引号/等号；连续多个时上一个值直接拼到下一个标记前）。
+    # 门槛与裸表达式一致：仅在已知工具名、且前面格式都没解出调用时启用；
+    # 首个标记必须在行首（splitter 端会主动扣留这类行首前缀）。
+    if not calls and known_tools:
+        colon_calls = _find_colon_joined_calls(rest, frozenset(known_tools))
+        if colon_calls:
+            out: list[str] = []
+            pos5 = 0
+            for name, args, s, e in colon_calls:
+                out.append(rest[pos5:s])
+                calls.append(_mk_tool_call(
+                    len(calls), name, json.dumps(args, ensure_ascii=False)))
+                pos5 = e
+            out.append(rest[pos5:])
+            rest = "".join(out)
+            rest = re.sub(r"(?m)^[ \t]*-{3,}[ \t]*\n?", "", rest)
 
     # glm-5.3 实测：正文带 <think>...</think>\n\n</think>（多一个游离闭标签）。
     # agent 模式不走 _sanitize_agent_leak，think 清洗在这里兜住。
