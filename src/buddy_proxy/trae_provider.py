@@ -9,6 +9,9 @@
    （3 级端点回退），SSE 流式返回。
 3. **转换**：Trae SSE（``event: output`` + ``{response, reasoning_content}``）
    → OpenAI chat.completion 格式（流式 / 非流式）。
+   另支持 anthropic 协议（/v1/messages，Claude Code 等）：请求侧由
+   anthropic_adapter 转成 chat，响应侧经 _wrap_anthropic_stream /
+   chat_completion_to_anthropic_message 还原成 Anthropic 格式。
 
 已知问题：Trae 上游模型层可能返回 ``3003 all models failed``（账号/配额/
 服务端问题），此时会透传错误信息给调用方。
@@ -30,12 +33,16 @@ import time
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any, AsyncIterator, Sequence
+from typing import Any, AsyncIterator, Iterator, Sequence
 
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .providers import BaseProvider
+from .anthropic_adapter import (
+    AnthropicStreamConverter,
+    chat_completion_to_anthropic_message,
+)
 
 log = logging.getLogger(__name__)
 
@@ -1814,6 +1821,59 @@ def _parse_sse(text: str) -> list[tuple[str, dict[str, Any]]]:
 
 # ───────────────────────── Provider 实现 ─────────────────────────
 
+def _anthropic_sse(event_name: str, payload: dict[str, Any]) -> str:
+    """构造一条 Anthropic SSE 事件（event + data）。"""
+    return f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _wrap_anthropic_stream(
+    openai_stream: Iterator[str], model: str
+) -> Iterator[str]:
+    """把 TraeProvider._stream 的 OpenAI chat chunk SSE 流包成 Anthropic 事件流。
+
+    /v1/messages（Claude Code 等 Anthropic 客户端）经 anthropic_to_chat 转成
+    chat 请求后路由到 Trae；本包装器把 OpenAI chunk 喂给
+    AnthropicStreamConverter，输出 message_start / content_block_delta /
+    message_stop 等标准事件（含 reasoning_content → thinking 块、
+    tool_calls → tool_use 块）。_stream 是同步生成器，此处保持同步迭代。
+    """
+    converter = AnthropicStreamConverter(model)
+    for piece in openai_stream:
+        for line in piece.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                continue
+            try:
+                chunk = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(chunk, dict) and chunk.get("error"):
+                # 错误 chunk → Anthropic error 事件（而非塞进正文文本）
+                err = chunk["error"]
+                msg = str(err.get("message", err))
+                code = err.get("code")
+                if code is not None and str(code) not in msg:
+                    msg = f"{msg} (code: {code})"
+                yield _anthropic_sse("error", {
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": msg,
+                    },
+                })
+                return
+            for event_name, payload in converter.feed_chunk(chunk):
+                yield _anthropic_sse(event_name, payload)
+    for event_name, payload in converter.finish():
+        yield _anthropic_sse(event_name, payload)
+    # 与 CodeBuddy 通道的 anthropic 流保持一致：message_stop 后补 [DONE]
+    # 确保 SSE 客户端立即结束等待
+    yield "data: [DONE]\n\n"
+
+
 class TraeProvider(BaseProvider):
     id = "trae"
     name = "Trae (本地解密直连)"
@@ -1885,18 +1945,39 @@ class TraeProvider(BaseProvider):
         if stream:
             include_usage = bool(
                 (body.get("stream_options") or {}).get("include_usage"))
+            # anthropic 协议没有 stream_options 字段，但 message_delta 需要
+            # usage（Claude Code 靠它统计 token），这里强制向 _stream 索取
+            if protocol == "anthropic":
+                include_usage = True
+            gen = self._stream(prompt, requested_model,
+                               sanitize=not agent_mode, tools=tools or None,
+                               include_usage=include_usage)
+            if protocol == "anthropic":
+                gen = _wrap_anthropic_stream(gen, requested_model)
             return StreamingResponse(
-                self._stream(prompt, requested_model,
-                             sanitize=not agent_mode, tools=tools or None,
-                             include_usage=include_usage),
+                gen,
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "Connection": "close"},
             )
         # 非流式聚合内部是同步 urllib 调用（最长 180s），放线程池执行，
         # 避免阻塞事件循环拖垮所有并发请求
-        collected = await asyncio.to_thread(
-            self._collect, prompt, requested_model, not agent_mode, tools or None
-        )
+        try:
+            collected = await asyncio.to_thread(
+                self._collect, prompt, requested_model, not agent_mode, tools or None
+            )
+        except HTTPException as e:
+            # anthropic 协议错误体用标准形状（Claude Code 等 SDK 靠它渲染错误）
+            if protocol == "anthropic":
+                return JSONResponse(
+                    status_code=e.status_code,
+                    content={
+                        "type": "error",
+                        "error": {"type": "api_error", "message": str(e.detail)},
+                    },
+                )
+            raise
+        if protocol == "anthropic":
+            collected = chat_completion_to_anthropic_message(collected, original)
         return JSONResponse(content=collected)
 
     def _stream(
