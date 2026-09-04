@@ -142,6 +142,50 @@ for p in ['查一下。\n', '\x3ctool_call na', 'me="shell" comm', 'and="pwd" in
 tail, calls = sp.flush()
 check("XML属性: 流式跨chunk", "".join(out) == "查一下。\n" and len(calls) == 1)
 
+# 20. 未转义双引号修复：单个裸 JSON（deepseek-v4-pro 实测 echo "---"）
+bad_q = '{ "name": "shell", "arguments": { "command": "ls 2>/dev/null; echo "---"; ls | grep diff", "intent": "查diff" } }'
+rest, calls = _parse_tool_calls(bad_q, KNOWN)
+check("引号修复: 单个裸JSON", len(calls) == 1 and calls[0]["function"]["name"] == "shell")
+if calls:
+    aq = json.loads(calls[0]["function"]["arguments"])
+    check("引号修复: 命令保留", 'echo "---"' in aq.get("command", ""))
+
+# 21. 未转义双引号修复：{ 和 "name" 之间有空格
+bad_sp = '{ "name": "shell", "arguments": { "command": "echo "hi"", "intent": "test" } }'
+rest, calls = _parse_tool_calls(bad_sp, KNOWN)
+check("引号修复: 空格形态", len(calls) == 1)
+
+# 22. 未转义双引号修复：同行连续多个
+bad_multi = (
+    '{"name": "shell", "arguments": {"command": "echo "PR1" && ls", "intent": "PR1"}} '
+    '{"name": "shell", "arguments": {"command": "echo "PR2" && ls", "intent": "PR2"}}'
+)
+rest, calls = _parse_tool_calls(bad_multi, KNOWN)
+check("引号修复: 同行连续2个", len(calls) == 2, f"calls={len(calls)}")
+
+# 23. 未转义双引号修复：<tool_call> 包裹
+bad_wrapped = '<tool_call>\n{"name": "shell", "arguments": {"command": "echo "hello" && ls"}}\n</tool_call>'
+rest, calls = _parse_tool_calls(bad_wrapped, KNOWN)
+check("引号修复: tool_call包裹", len(calls) == 1)
+
+# 24. 未转义双引号修复：流式路径
+sp = _StreamToolCallSplitter(KNOWN)
+out = []
+full = '查一下。\n' + bad_q
+for k in range(0, len(full), 25):
+    out.append(sp.feed(full[k:k+25]))
+tail, calls = sp.flush()
+tail2, calls2 = _parse_tool_calls(tail, KNOWN)
+check("引号修复: 流式", len(calls) + len(calls2) == 1 and "shell" not in "".join(out))
+
+# 25. 正常 JSON 不被误修
+good = '{"name": "shell", "arguments": {"command": "ls -la", "intent": "列目录"}}'
+rest, calls = _parse_tool_calls(good, KNOWN)
+check("引号修复: 正常JSON不变", len(calls) == 1 and rest == "")
+if calls:
+    ag = json.loads(calls[0]["function"]["arguments"])
+    check("引号修复: 正常参数", ag["command"] == "ls -la")
+
 print()
 print("RESULT:", "ALL PASS" if not fails else f"FAILED: {fails}")
 sys.exit(1 if fails else 0)

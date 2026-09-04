@@ -558,8 +558,9 @@ _TOOL_STREAM_TAGS = ("tool_call", "tool_calls", "tool_action", "tool_name", "too
 
 # 裸 JSON 工具调用候选前缀：模型偶尔省略标签，直接在行首输出
 # {"name": ...} 或 [{"name": ...}]（数组包多个调用）
-_BARE_CANDS = ('{"name"', '[{"name"')
-_BARE_RE = re.compile(r'(?m)^[ \t]*(\[\{"name"|\{"name")')
+# deepseek-v4-pro 偶尔在 { 和 " 之间加空格：{ "name": ... }
+_BARE_CANDS = ('{"name"', '{ "name"', '[{"name"', '[{ "name"', '[ {"name"')
+_BARE_RE = re.compile(r'(?m)^[ \t]*(\[\s*\{\s*"name"|\{\s*"name")')
 
 # XML 属性风格工具调用：<tool_call name="..." command="..." />
 # 属性值里可能含 '>'（如 shell 命令 2>/dev/null），不能用简单正则匹配整标签，
@@ -768,6 +769,83 @@ def _flatten_call_args(obj: dict[str, Any]) -> dict[str, Any]:
         except Exception:
             pass
     return args if isinstance(args, dict) else {"input": args}
+
+
+def _find_obj_extent(text: str, start: int) -> int:
+    """Best-effort brace-depth scan to find the end of a JSON object.
+
+    Returns the index *after* the matching ``}`` or -1 if unbalanced.
+    Tolerant of broken strings (unescaped quotes inside values) —
+    only used as a rough boundary for the subsequent repair pass.
+    """
+    if start >= len(text) or text[start] != "{":
+        return -1
+    depth = 0
+    i = start
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return -1
+
+
+def _repair_json_quotes(s: str) -> str | None:
+    """Try to fix unescaped double-quotes inside JSON string values.
+
+    DeepSeek v4 pro occasionally emits shell commands with unescaped ``"``
+    (e.g. ``echo "---"``), which makes the JSON invalid.  Walk through the
+    text tracking string-state; when a ``"`` inside a string is followed by
+    a non-structural character, escape it.
+
+    Returns the repaired string, or *None* if no repair was applied or the
+    input doesn't look like a JSON object/array.
+    """
+    stripped = s.lstrip()
+    if not stripped or stripped[0] not in "{[":
+        return None
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    in_string = False
+    repaired_any = False
+    while i < n:
+        ch = s[i]
+        if not in_string:
+            out.append(ch)
+            if ch == '"':
+                in_string = True
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            out.append(s[i : i + 2])
+            i += 2
+            continue
+        if ch == '"':
+            j = i + 1
+            while j < n and s[j] in " \t\r\n":
+                j += 1
+            if j >= n or s[j] in ":,}]":
+                out.append(ch)
+                in_string = False
+            else:
+                out.append('\\"')
+                repaired_any = True
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    if not repaired_any:
+        return None
+    return "".join(out)
 
 
 class _StreamToolCallSplitter:
@@ -1042,6 +1120,24 @@ def _parse_tool_calls(
                 try:
                     obj, end = _TOOL_DECODER.raw_decode(content, j)
                 except ValueError:
+                    raw_end = _find_obj_extent(content, j)
+                    if raw_end != -1:
+                        repaired = _repair_json_quotes(content[j:raw_end])
+                        if repaired:
+                            try:
+                                obj = json.loads(repaired)
+                            except (ValueError, TypeError):
+                                obj = None
+                            if isinstance(obj, dict):
+                                nm = obj.get("name") or obj.get("tool") or ""
+                                ag = obj.get("arguments", obj.get("args", {}))
+                                if not isinstance(ag, dict):
+                                    ag = {"input": ag}
+                                if nm:
+                                    block_calls.append(
+                                        (str(nm), json.dumps(ag, ensure_ascii=False)))
+                                j = raw_end
+                                continue
                     break
                 name = obj.get("name") or obj.get("tool") or ""
                 args = obj.get("arguments", obj.get("args", {}))
@@ -1131,6 +1227,9 @@ def _parse_tool_calls(
     # 兜底二：无标签裸 JSON（仅 agent 请求、且前两种格式都没解析出调用）
     if not calls and known_tools:
         known = frozenset(known_tools)
+        # 同一行连续多个裸 JSON（deepseek-v4-pro 实测）：在 } {"name" 边界
+        # 插入换行，使后续对象也能被 _BARE_RE 的行首锚点匹配到
+        rest = re.sub(r'}\s+(?=\{\s*"name")', '}\n', rest)
         rest_parts2: list[str] = []
         pos = 0
         while True:
@@ -1142,6 +1241,26 @@ def _parse_tool_calls(
             try:
                 obj, end = _TOOL_DECODER.raw_decode(rest, js)
             except ValueError:
+                raw_end = _find_obj_extent(rest, js)
+                if raw_end != -1:
+                    repaired = _repair_json_quotes(rest[js:raw_end])
+                    if repaired:
+                        try:
+                            obj = json.loads(repaired)
+                        except (ValueError, TypeError):
+                            obj = None
+                        if obj:
+                            items = obj if isinstance(obj, list) else [obj]
+                            if all(_valid_bare_call_obj(it, known) for it in items):
+                                rest_parts2.append(rest[pos:m.start()].rstrip())
+                                for it in items:
+                                    nm = it.get("name") or it.get("tool") or ""
+                                    ag = _flatten_call_args(it)
+                                    calls.append(_mk_tool_call(
+                                        len(calls), str(nm),
+                                        json.dumps(ag, ensure_ascii=False)))
+                                pos = raw_end
+                                continue
                 rest_parts2.append(rest[pos:m.end()])
                 pos = m.end()
                 continue
@@ -1220,35 +1339,45 @@ def _extract_prompt(
     tools_taught = False
     teaching = _build_tools_system(tools) if tools else ""
 
+    def _content_parts(content: Any) -> list[dict[str, Any]]:
+        """OpenAI content -> Trae block 数组，保留 image_url 等多模态 block。
+
+        上游 llm_utils_chat 认 OpenAI 风格的 image_url block（data URL 实测
+        glm-5.3-flash 能读图），此前把 content 拍平成纯文本导致图片被静默
+        丢弃、模型回答"没有看到图片"。
+        """
+        if isinstance(content, str):
+            return [{"type": "text", "text": content}]
+        parts: list[dict[str, Any]] = []
+        if isinstance(content, list):
+            for p in content:
+                if not isinstance(p, dict):
+                    continue
+                ptype = p.get("type")
+                if ptype == "text":
+                    if p.get("text"):
+                        parts.append({"type": "text", "text": p.get("text", "")})
+                elif ptype == "image_url":
+                    iu = p.get("image_url")
+                    url = iu.get("url") if isinstance(iu, dict) else iu
+                    if url:
+                        parts.append({"type": "image_url", "image_url": {"url": url}})
+        return parts or [{"type": "text", "text": ""}]
+
     for m in messages:
         role = m.get("role", "user")
         content = m.get("content", "")
-        if isinstance(content, str):
-            text = content
-        elif isinstance(content, list):
-            text = "".join(
-                p.get("text", "") for p in content
-                if isinstance(p, dict) and p.get("type") == "text"
-            )
-        else:
-            text = ""
-
-        tool_calls = m.get("tool_calls") if isinstance(m, dict) else None
-        if role == "assistant" and tool_calls:
-            # 上游不认 tool_calls 字段：序列化成教学格式的调用块拼进正文
-            if text:
-                text = text + "\n" + _serialize_tool_calls(tool_calls)
-            else:
-                text = _serialize_tool_calls(tool_calls)
-        elif role in ("tool", "function"):
-            # 工具结果消息：转 user 角色 + [tool_result] 前缀（上游无此角色概念）
-            name = m.get("name") or (
-                (m.get("tool_call_id") and "") or "tool"
-            )
-            text = f"[tool_result | {name}]\n{text}"
-            role = "user"
 
         if role == "system" and not guard_merged:
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = "".join(
+                    p.get("text", "") for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+            else:
+                text = ""
             merged = text
             if guard:
                 merged = _AGENT_GUARD + "\n\n" + merged
@@ -1258,7 +1387,24 @@ def _extract_prompt(
             out.append({"role": "system", "content": [{"type": "text", "text": merged}]})
             guard_merged = True
             continue
-        out.append({"role": role, "content": [{"type": "text", "text": text}]})
+
+        parts = _content_parts(content)
+        text = "".join(p["text"] for p in parts if p["type"] == "text")
+
+        tool_calls = m.get("tool_calls") if isinstance(m, dict) else None
+        if role == "assistant" and tool_calls:
+            # 上游不认 tool_calls 字段：序列化成教学格式的调用块拼进正文
+            block = _serialize_tool_calls(tool_calls)
+            parts.append({"type": "text", "text": ("\n" + block) if text else block})
+        elif role in ("tool", "function"):
+            # 工具结果消息：转 user 角色 + [tool_result] 前缀（上游无此角色概念）
+            name = m.get("name") or (
+                (m.get("tool_call_id") and "") or "tool"
+            )
+            parts.insert(0, {"type": "text", "text": f"[tool_result | {name}]\n"})
+            role = "user"
+
+        out.append({"role": role, "content": parts})
 
     if guard and not guard_merged:
         out.insert(0, {
