@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import urllib.parse
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterator, Sequence
 
@@ -52,6 +53,18 @@ log = logging.getLogger(__name__)
 BIGMODEL_ANTHROPIC_BASE = "https://open.bigmodel.cn/api/anthropic"
 ZAI_ANTHROPIC_BASE = "https://api.z.ai/api/anthropic"
 BIGMODEL_OPENAI_BASE = "https://open.bigmodel.cn/api/paas/v4"
+ZAI_OPENAI_BASE = "https://api.z.ai/api/paas/v4"
+
+
+def _openai_base_for(anthropic_base: str) -> str:
+    """由 anthropic base 推导同域 openai 兼容端点。
+
+    key 从 ZCode CLI 配置解析、且启用的是 zai（国际 api.z.ai）通道时，
+    key 是 z.ai 域的——openai/responses 请求若还打 open.bigmodel.cn 必然
+    401。anthropic 请求走 self._base 没问题，openai 端点必须同域跟随。
+    """
+    host = urllib.parse.urlparse(anthropic_base).netloc.lower()
+    return ZAI_OPENAI_BASE if "z.ai" in host else BIGMODEL_OPENAI_BASE
 
 # 与 ZCode CLI 内置模型表一致（~/.zcode/v2/config.json）。
 # id 用**小写**（与全站 models_config.json / Claude Code 侧配置一致），
@@ -84,12 +97,20 @@ def _secret_file_path() -> Path:
 
 
 def _load_secret_file() -> str:
-    """支持 'name=value' 或裸 value 两种行格式。"""
+    """secrets 约定文件 ~/.ethan/.secrets/zcode_api_key，支持 'name=value' 或裸 value。
+
+    只取首行、且按行切分：secrets 文件若真有多行，把整块文本当 key 发给
+    上游必然 401（单行文件不受影响）。按行解析天然规避该问题。
+    """
     try:
-        text = _secret_file_path().read_text().strip()
-        return text.split("=", 1)[1].strip() if "=" in text and "\n" not in text else text
+        for raw in _secret_file_path().read_text().splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            return line.split("=", 1)[1].strip() if "=" in line else line
     except Exception:
-        return ""
+        pass
+    return ""
 
 
 def _load_zcode_config_key() -> tuple[str, str]:
@@ -244,7 +265,7 @@ class ZcodeProvider(BaseProvider):
         else:
             # openai / responses：转投 GLM 原生 OpenAI 兼容端点（model 透传）
             upstream_body = {k: v for k, v in body.items() if not k.startswith("_")}
-            url = f"{BIGMODEL_OPENAI_BASE}/chat/completions"
+            url = f"{_openai_base_for(self._base)}/chat/completions"
             headers = {
                 "Authorization": f"Bearer {self._api_key}",
                 "Content-Type": "application/json",
@@ -256,18 +277,27 @@ class ZcodeProvider(BaseProvider):
         try:
             resp = await client.send(req, stream=stream)
         except httpx.TimeoutException as exc:
+            log.warning("zcode upstream timeout: %s", exc)
             raise HTTPException(status_code=504, detail={
-                "error": {"message": f"zcode upstream timeout: {exc}", "type": "timeout"}}
+                "error": {"message": "zcode upstream timeout", "type": "timeout"}}
             ) from exc
         except httpx.HTTPError as exc:
+            log.warning("zcode upstream error: %s", exc)
             raise HTTPException(status_code=502, detail={
-                "error": {"message": f"zcode upstream error: {exc}", "type": "bad_gateway"}}
+                "error": {"message": "zcode upstream error", "type": "bad_gateway"}}
             ) from exc
 
         if resp.status_code >= 400:
             if stream:
+                # 先把错误体读完再关流：aclose() 会丢弃未读的 body，
+                # 之后 _upstream_error_response 的 json()/text() 拿不到
+                # 上游真实错误（429 配额 / 401 key 无效都会变成空错误体
+                # 甚至 500）。错误体一般很小，先 aread() 成本可忽略。
+                await resp.aread()
+            try:
+                return _upstream_error_response(resp)
+            finally:
                 await resp.aclose()
-            return _upstream_error_response(resp)
 
         if stream:
             return StreamingResponse(

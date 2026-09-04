@@ -92,7 +92,7 @@ def main():
                              "凭据取 ZCODE_API_KEY / secrets / ~/.zcode/v2/config.json）")
     parser.add_argument("--default-provider", default=os.getenv("PROXY_DEFAULT_PROVIDER", "codebuddy"),
                         help="兜底通道：模型名未命中任何 provider 时转发到哪个通道 "
-                             "（codebuddy/trae/doubao，默认 codebuddy；可用 PROXY_DEFAULT_PROVIDER 覆盖）")
+                             "（codebuddy/zcode/trae/doubao，默认 codebuddy；可用 PROXY_DEFAULT_PROVIDER 覆盖）")
     args = parser.parse_args()
     args.log_file = args.log_file.expanduser()
 
