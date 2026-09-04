@@ -62,13 +62,20 @@ except ImportError:
 
 
 try:
-    from buddy_proxy.anthropic_adapter import anthropic_to_chat, AnthropicStreamConverter
+    from buddy_proxy.anthropic_adapter import (
+        AnthropicStreamConverter,
+        anthropic_to_chat,
+        chat_completion_to_anthropic_message,
+    )
     HAS_ANTHROPIC_ADAPTER = True
 except ImportError:
     HAS_ANTHROPIC_ADAPTER = False
 
     def anthropic_to_chat(body):
         raise RuntimeError("anthropic_adapter not available - cannot convert /v1/messages requests")
+
+    def chat_completion_to_anthropic_message(data, original=None):
+        raise RuntimeError("anthropic_adapter not available - cannot convert to anthropic format")
 
     AnthropicStreamConverter = None
 
@@ -212,9 +219,9 @@ async def forward_chat(
                 break
 
     if provider is not None:
-        # 非默认 provider（豆包等）：仅 openai 协议透传（doubao2api 只支持
-        # OpenAI chat completions；responses/anthropic 协议由调用方决定，
-        # 这里统一按 openai 透传，客户端应使用 openai 协议接入）。
+        # 非默认 provider（Trae/豆包等）：由各自 forward 决定协议支持范围。
+        # Trae 已支持 anthropic 协议（/v1/messages 客户端如 Claude Code 可直连）；
+        # 豆包等仅 openai 协议透传（doubao2api 只支持 OpenAI chat completions）。
         diagnostic("provider_route", provider=provider.id, model=requested_model, protocol=protocol)
         try:
             provider.ensure_auth()
@@ -865,34 +872,7 @@ def convert_nonstream(data: dict[str, Any], protocol: str, original: dict[str, A
     content = message.get("content", "")
 
     if protocol == "anthropic":
-        content_blocks = []
-        if content:
-            content_blocks.append({"type": "text", "text": content})
-        for call in message.get("tool_calls") or []:
-            fn = call.get("function") or {}
-            try:
-                arguments = json.loads(fn.get("arguments", "{}"))
-            except json.JSONDecodeError:
-                arguments = fn.get("arguments", "")
-            content_blocks.append({
-                "type": "tool_use",
-                "id": call.get("id", ""),
-                "name": fn.get("name", ""),
-                "input": arguments
-            })
-        return {
-            "id": "msg_" + uuid.uuid4().hex,
-            "type": "message",
-            "role": "assistant",
-            "model": (original or {}).get("model", data.get("model", "default")),
-            "content": content_blocks,
-            "stop_reason": "tool_use" if message.get("tool_calls") else "end_turn",
-            "stop_sequence": None,
-            "usage": {
-                "input_tokens": (data.get("usage") or {}).get("prompt_tokens", 0),
-                "output_tokens": (data.get("usage") or {}).get("completion_tokens", 0)
-            }
-        }
+        return chat_completion_to_anthropic_message(data, original)
 
     elif protocol == "responses":
         # 构建 content 数组（文本 + 工具调用）

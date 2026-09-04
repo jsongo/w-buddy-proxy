@@ -267,22 +267,26 @@ class AnthropicStreamConverter:
     
     事件序列：
         1. message_start
-        2. content_block_start (text)
-        3. content_block_delta (text_delta，多次)
-        4. content_block_stop
-        5. content_block_start (tool_use)
-        6. content_block_delta (input_json_delta，多次)
-        7. content_block_stop
-        8. message_delta (stop_reason + usage)
-        9. message_stop
+        2. content_block_start (thinking，仅推理模型有 reasoning_content 时)
+        3. content_block_delta (thinking_delta，多次)
+        4. content_block_start (text)
+        5. content_block_delta (text_delta，多次)
+        6. content_block_stop
+        7. content_block_start (tool_use)
+        8. content_block_delta (input_json_delta，多次)
+        9. content_block_stop
+        10. message_delta (stop_reason + usage)
+        11. message_stop
     """
     
     def __init__(self, model: str):
         self.message_id = _rand_id("msg_")
         self.model = model
-        
+
         # 状态跟踪
         self.started = False
+        self.thinking_block_index: int | None = None  # 当前thinking块的index
+        self.thinking = ""
         self.text_block_index: int | None = None  # 当前text块的index
         self.text = ""
         self.tool_blocks: dict[int, dict] = {}  # Chat index -> {Anthropic index, id, name, arguments}
@@ -320,6 +324,30 @@ class AnthropicStreamConverter:
         for choice in chunk.get("choices", []):
             self.finish_reason = choice.get("finish_reason") or self.finish_reason
             delta = choice.get("delta", {})
+            
+            # 思维链（reasoning_content，DeepSeek/glm 等推理模型的 OpenAI 风格扩展）
+            # → Anthropic thinking 块。thinking 块必须排在 text 之前，
+            # 推理模型总是先出 reasoning 再出正文，天然满足。
+            if delta.get("reasoning_content"):
+                think_delta = str(delta["reasoning_content"])
+                self.thinking += think_delta
+                
+                # 首次思维链：打开thinking块（signature 留空，兼容 Claude Code）
+                if self.thinking_block_index is None:
+                    self.thinking_block_index = self.next_anthropic_index
+                    self.next_anthropic_index += 1
+                    self.open_blocks.add(self.thinking_block_index)
+                    events.append(("content_block_start", {
+                        "type": "content_block_start",
+                        "index": self.thinking_block_index,
+                        "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+                    }))
+                
+                events.append(("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": self.thinking_block_index,
+                    "delta": {"type": "thinking_delta", "thinking": think_delta},
+                }))
             
             # 文本内容
             if delta.get("content"):
@@ -416,10 +444,11 @@ class AnthropicStreamConverter:
         stop_reason = stop_reason_map.get(self.finish_reason or "stop", "end_turn")
         
         # 映射usage
-        usage_delta = {"output_tokens": 0}
+        usage_delta = {"input_tokens": 0, "output_tokens": 0}
         if self.usage:
-            # Chat使用completion_tokens，Anthropic使用output_tokens
+            # Chat使用completion_tokens/prompt_tokens，Anthropic使用output_tokens/input_tokens
             usage_delta["output_tokens"] = self.usage.get("completion_tokens", 0)
+            usage_delta["input_tokens"] = self.usage.get("prompt_tokens", 0)
         
         # 发出message_delta
         events.append(("message_delta", {
@@ -436,6 +465,75 @@ class AnthropicStreamConverter:
         
         return events
     
+
+
+# ---------------------------------------------------------------------------
+# 响应转换：Chat Completion（非流式聚合结果）→ Anthropic Message
+# ---------------------------------------------------------------------------
+
+def _split_leading_think(content: str) -> tuple[str, str]:
+    """拆出正文开头内联的 <think>...</think> 思维链，返回 (thinking, text)。
+
+    部分上游（如 Trae provider 的 _collect）会把 reasoning 合并成
+    ``<think>\\n...\\n</think>\\n\\n正文`` 内联进 content；Anthropic 协议
+    里思维链应是独立的 thinking 块，此处拆开。仅认开头位置，避免误伤
+    正文中举例的 think 标签。
+    """
+    if not content.startswith("<think>"):
+        return "", content
+    end = content.find("</think>")
+    if end == -1:
+        return "", content
+    thinking = content[len("<think>"):end].strip("\n")
+    text = content[end + len("</think>"):].lstrip("\n")
+    return thinking, text
+
+
+def chat_completion_to_anthropic_message(
+    data: dict, original: dict | None = None
+) -> dict:
+    """将聚合的 OpenAI chat.completion 转换为 Anthropic Messages 响应。
+
+    - 文本 → text 块；开头内联的 <think>...</think> → thinking 块
+    - tool_calls → tool_use 块（arguments 反序列化为 input 对象）
+    - finish_reason 映射 stop_reason；usage 映射 token 字段
+    """
+    choice = (data.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    content = message.get("content") or ""
+
+    thinking, text = _split_leading_think(content)
+
+    content_blocks = []
+    if thinking:
+        content_blocks.append({"type": "thinking", "thinking": thinking, "signature": ""})
+    if text:
+        content_blocks.append({"type": "text", "text": text})
+    for call in message.get("tool_calls") or []:
+        fn = call.get("function") or {}
+        try:
+            arguments = json.loads(fn.get("arguments", "{}"))
+        except json.JSONDecodeError:
+            arguments = fn.get("arguments", "")
+        content_blocks.append({
+            "type": "tool_use",
+            "id": call.get("id", ""),
+            "name": fn.get("name", ""),
+            "input": arguments,
+        })
+    return {
+        "id": _rand_id("msg_"),
+        "type": "message",
+        "role": "assistant",
+        "model": (original or {}).get("model", data.get("model", "default")),
+        "content": content_blocks,
+        "stop_reason": "tool_use" if message.get("tool_calls") else "end_turn",
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": (data.get("usage") or {}).get("prompt_tokens", 0),
+            "output_tokens": (data.get("usage") or {}).get("completion_tokens", 0),
+        },
+    }
 
 
 # 向后兼容别名
