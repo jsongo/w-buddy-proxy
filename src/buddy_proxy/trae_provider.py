@@ -1762,21 +1762,26 @@ _TRAE_ERROR_HINTS: dict[int, str] = {
     4021: "Trae 今日会话次数已达上限，请明日再试",
     4022: "Trae 请求失败，请尝试新建会话并重试",
     4023: "Trae 模型列表已更新，请确认后重试",
+    4031: "Trae 今日请求额度已用完，请明日再试（每日 0 点重置）",
     4050: "Trae 请求超时，模型服务资源紧张，请稍后重试",
     4051: "Trae 请求超时，模型服务资源紧张，请稍后重试",
 }
 
 
 def _trae_error_text(data: dict[str, Any]) -> str:
-    """把 Trae 错误事件转成友好中文文案。"""
+    """把 Trae 错误事件转成友好中文文案（附错误码，便于定位）。"""
     code = data.get("code")
     msg = data.get("message") or data.get("error") or ""
     if isinstance(code, int) and code in _TRAE_ERROR_HINTS:
         hint = _TRAE_ERROR_HINTS[code]
-        return f"{hint}" + (f"（{msg}）" if msg and msg not in hint else "")
-    if msg:
-        return f"Trae 错误: {msg}"
-    return "Trae 未知错误"
+        text = hint + (f"（{msg}）" if msg and msg not in hint else "")
+    elif msg:
+        text = f"Trae 错误: {msg}"
+    else:
+        text = "Trae 未知错误"
+    if code is not None and str(code) not in text:
+        text = f"{text} (code: {code})"
+    return text
 
 def _parse_sse(text: str) -> list[tuple[str, dict[str, Any]]]:
     """解析 Trae SSE 流 -> [(event, data_dict), ...]。"""
@@ -1931,6 +1936,15 @@ class TraeProvider(BaseProvider):
             }
             return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
+        def error_chunk(msg: str, code: Any = None) -> str:
+            # 结构化错误 chunk（与 CodeBuddy 通道 stream_upstream 的错误格式一致）。
+            # 不能塞进 content 文本——anthropic 客户端（Claude Code）会把
+            # 伪正文当模型输出继续循环；包装层据此转成 event: error
+            err: dict[str, Any] = {"message": msg, "type": "upstream_error"}
+            if code is not None:
+                err["code"] = code
+            return f"data: {json.dumps({'error': err}, ensure_ascii=False)}\n\n"
+
         try:
             raw = send_trae_chat(messages, model, stream=True, base_url=self._base_url)
             cleaner = _StreamLeakCleaner() if sanitize else None
@@ -1940,8 +1954,7 @@ class TraeProvider(BaseProvider):
             dbg_parts: list[str] = []
             for event, data in _parse_sse(raw):
                 if event == "error":
-                    msg = _trae_error_text(data)
-                    yield chunk({"content": f"[{msg}]"})
+                    yield error_chunk(_trae_error_text(data), (data or {}).get("code"))
                     yield "data: [DONE]\n\n"
                     return
                 if event == "output":
@@ -1971,12 +1984,12 @@ class TraeProvider(BaseProvider):
                 elif event == "done":
                     break
         except HTTPException as e:
-            yield chunk({"content": f"[Error {e.status_code}]"})
+            yield error_chunk(f"trae error {e.status_code}: {e.detail}", e.status_code)
             yield "data: [DONE]\n\n"
             return
         except Exception as e:
             log.error("Trae stream error: %s", e)
-            yield chunk({"content": f"[Error: {e}]"})
+            yield error_chunk(f"trae stream error: {e}")
             return
 
         finish = "stop"
@@ -2048,7 +2061,9 @@ class TraeProvider(BaseProvider):
             content = _sanitize_agent_leak(content)
         _debug_dump("debug_trae_response", model=model, stream=False, content=content,
                     tool_calls=len(tool_calls))
-        if not content and not reasoning:
+        # 只有 tool_calls 没有正文也是合法响应（agent 直接发起调用），
+        # 不注入空响应兜底文案——否则会混进 Anthropic tool_use 消息正文
+        if not content and not reasoning and not tool_calls:
             content = "(trae upstream 返回了空响应，未产生任何内容)"
         if reasoning:
             if content:
