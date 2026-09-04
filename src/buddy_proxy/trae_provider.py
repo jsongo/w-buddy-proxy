@@ -27,8 +27,10 @@ import json
 import logging
 import os
 import platform
+import queue
 import re
 import sys
+import threading
 import time
 import urllib.request
 import uuid
@@ -419,6 +421,20 @@ def _debug_dump(event: str, **kwargs: Any) -> None:
         get_state().write_log(event, **kwargs)
     except Exception:
         pass
+
+
+# 等待上游期间的心跳间隔（秒）；0 = 关闭心跳。
+# 背景：Trae 上游是「整段缓冲」模式——send_trae_chat 同步读完整个 SSE 才返回，
+# 生成期间客户端收不到任何数据。长生成（深度 review 大报告等）会触发下游
+# 单 chunk 超时（实测 Ethan _CHUNK_TIMEOUT=120s → 回合中止、落库空回复）。
+# _stream 在等待时按此间隔发一条 reasoning_content 心跳提示，既喂饱下游
+# 超时计时器（续命），又让下游 UI 知道中转还在等。45s 意味着 120s 超时窗口
+# 内至少有 2 次心跳，单次 SSE 分包延迟也不会误杀；每条 ~30 字节，开销可忽略。
+TRAE_HEARTBEAT_INTERVAL = max(0, int(os.environ.get("WB_TRAE_HEARTBEAT_INTERVAL", "45")))
+
+
+def _heartbeat_text(waited: int) -> str:
+    return f"⏳ [trae 中转] 上游模型仍在生成，已等待 {waited}s（流保持存活）…"
 
 
 # 注入的 agent 协议压制指令（见 _extract_prompt 说明）
@@ -2027,7 +2043,40 @@ class TraeProvider(BaseProvider):
             return f"data: {json.dumps({'error': err}, ensure_ascii=False)}\n\n"
 
         try:
-            raw = send_trae_chat(messages, model, stream=True, base_url=self._base_url)
+            # 上游调用放独立读线程：send_trae_chat 是同步整段缓冲读（最长受
+            # 上游 socket 180s 超时约束），原实现直接在生成器线程里阻塞读——
+            # 生成期间客户端收不到任何字节，长生成（深度 review 大报告等）会
+            # 触发下游单 chunk 超时（实测 Ethan _CHUNK_TIMEOUT=120s）→ 回合
+            # 中止、落库空回复。拆成读线程 + 带 timeout 的队列等待后，等待
+            # 间隙按 TRAE_HEARTBEAT_INTERVAL 发 reasoning 心跳：喂饱下游超时
+            # 计时器（续命），也让下游 UI 知道中转还在等上游。
+            _ev_q: queue.Queue = queue.Queue()
+
+            def _read_upstream() -> None:
+                try:
+                    _ev_q.put(("raw", send_trae_chat(
+                        messages, model, stream=True, base_url=self._base_url)))
+                except BaseException as e:  # noqa: BLE001 — 原样转主线程抛出
+                    _ev_q.put(("error", e))
+
+            threading.Thread(target=_read_upstream, daemon=True,
+                             name="trae-sse-reader").start()
+            raw: str | None = None
+            _waited = 0
+            while raw is None:
+                try:
+                    if TRAE_HEARTBEAT_INTERVAL > 0:
+                        kind, payload = _ev_q.get(timeout=TRAE_HEARTBEAT_INTERVAL)
+                    else:
+                        kind, payload = _ev_q.get()  # 心跳关闭：纯阻塞等
+                except queue.Empty:
+                    _waited += TRAE_HEARTBEAT_INTERVAL
+                    _debug_dump("trae_heartbeat", waited=_waited)
+                    yield chunk({"reasoning_content": _heartbeat_text(_waited)})
+                    continue
+                if kind == "error":
+                    raise payload
+                raw = payload
             cleaner = _StreamLeakCleaner() if sanitize else None
             splitter = (
                 _StreamToolCallSplitter(_tool_names(tools)) if tools else None
