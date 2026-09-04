@@ -25,7 +25,7 @@ The proxy is a plain Python package under `src/`. Run from source with [uv](http
 
 ```bash
 uv sync
-uv run python -m codebuddy_proxy --desensitize
+uv run python -m buddy_proxy --desensitize
 ```
 
 Or use the convenient management script `proxy.sh` (recommended for background use):
@@ -45,14 +45,14 @@ PROXY_PORT=9000 PROXY_EXTRA_ARGS="--desensitize --optimize-context" ./proxy.sh s
 The script:
 - Detects `.venv/bin/python` automatically (preferring the project venv).
 - Uses `nohup ... &` so `start` returns immediately — terminal is **not** blocked.
-- Writes the PID to `logs/proxy.pid` and startup output to `logs/proxy.sh.log`; app logs rotate daily (`logs/proxy.log` + `logs/codebuddy-proxy.jsonl`, 30 days kept).
+- Writes the PID to `logs/proxy.pid` and startup output to `logs/proxy.sh.log`; app logs rotate daily (`logs/proxy.log` + `logs/buddy-proxy.jsonl`, 30 days kept).
 - Stops cleanly with `kill`; falls back to `kill -9` after 10s if the process doesn't exit.
 
 ---
 
 ## Models
 
-Both static (`src/codebuddy_proxy/models_config.json`) and remote model lists are supported. Use `--static-models` to force the built-in list (useful when offline or behind an unsynced remote):
+Both static (`src/buddy_proxy/models_config.json`) and remote model lists are supported. Use `--static-models` to force the built-in list (useful when offline or behind an unsynced remote):
 
 ```bash
 ./proxy.sh start -- --static-models
@@ -75,17 +75,17 @@ The static catalog currently ships **11 models** with their credit multiplier (�
 | `deepseek-v4-flash` | Deepseek-V4-Flash | x0.17 |
 | `deepseek-v4-pro` | Deepseek-V4-Pro | x0.51 |
 
-Edit `src/codebuddy_proxy/models_config.json` to add or tweak entries — the static list is loaded at startup when `--static-models` is passed (or when remote fetch fails).
+Edit `src/buddy_proxy/models_config.json` to add or tweak entries — the static list is loaded at startup when `--static-models` is passed (or when remote fetch fails).
 
 First-time login (opens a browser):
 
 ```bash
-uv run python -m codebuddy_proxy --login --desensitize
+uv run python -m buddy_proxy --login --desensitize
 ```
 
 It listens on `http://127.0.0.1:8787` by default.
 
-> A handy `start.sh` is included: `uv run python -m codebuddy_proxy --desensitize --port 8787`.
+> A handy `start.sh` is included: `uv run python -m buddy_proxy --desensitize --port 8787`.
 
 ## Quick check
 
@@ -208,7 +208,7 @@ providers:
 --port PORT               bind port (default 8787)
 --endpoint ENDPOINT       CodeBuddy backend address
 --session-file PATH       session file (default ~/.codebuddy-session.json)
---log-file PATH           JSONL log (default <project>/logs/codebuddy-proxy.jsonl, override via CODEBUDDY_PROXY_LOG_FILE)
+--log-file PATH           JSONL log (default <project>/logs/buddy-proxy.jsonl, override via BUDDY_PROXY_LOG_FILE)
 --desensitize             enable desensitization (recommended)
 --optimize-context        enable message compression (recommended for Codex)
 --login                   browser login at startup
@@ -217,7 +217,7 @@ providers:
 --mock-dir DIR            serve recorded fixtures (testing)
 ```
 
-Env vars: `CODEBUDDY_PROXY_HOST`, `CODEBUDDY_PROXY_PORT`, `CODEBUDDY_ENDPOINT`, `CODEBUDDY_PROXY_LOG_FILE`.
+Env vars: `BUDDY_PROXY_HOST`, `BUDDY_PROXY_PORT`, `CODEBUDDY_ENDPOINT`, `BUDDY_PROXY_LOG_FILE`.
 
 ## API endpoints
 

@@ -15,7 +15,7 @@ def setup_logging(log_dir: pathlib.Path) -> logging.Logger:
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "proxy.log"
 
-    logger = logging.getLogger("codebuddy_proxy")
+    logger = logging.getLogger("buddy_proxy")
     logger.setLevel(logging.INFO)
     logger.propagate = False
     logger.handlers.clear()
@@ -36,7 +36,7 @@ def setup_logging(log_dir: pathlib.Path) -> logging.Logger:
 
 def setup_json_logging(log_file: pathlib.Path) -> logging.Logger:
     """配置 JSONL 滚动日志：按天分片，保留30天。"""
-    logger = logging.getLogger("codebuddy_proxy.jsonl")
+    logger = logging.getLogger("buddy_proxy.jsonl")
     logger.setLevel(logging.INFO)
     logger.propagate = False
     logger.handlers.clear()
@@ -57,7 +57,7 @@ def now_s() -> int:
 
 def get_runtime_info() -> dict[str, str]:
     try:
-        app_version = importlib.metadata.version("codebuddy-proxy")
+        app_version = importlib.metadata.version("buddy-proxy")
     except importlib.metadata.PackageNotFoundError:
         app_version = "unknown"
     return {

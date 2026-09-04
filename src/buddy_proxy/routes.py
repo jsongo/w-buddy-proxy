@@ -13,14 +13,14 @@ from typing import Any
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-from codebuddy_proxy.state import (
+from buddy_proxy.state import (
     app,
     _get_state_or_none,
     diagnostic,
     get_state,
 )
-from codebuddy_proxy.model_list import load_models_from_local_config, model_to_codex_format
-from codebuddy_proxy.codebuddy_provider import (
+from buddy_proxy.model_list import load_models_from_local_config, model_to_codex_format
+from buddy_proxy.codebuddy_provider import (
     HAS_PROJECTION,
     anthropic_to_chat,
     body_summary,
@@ -32,7 +32,7 @@ from codebuddy_proxy.codebuddy_provider import (
 
 # 尝试导入高级功能模块（可选）
 try:
-    from codebuddy_proxy.desensitize import desensitize_body
+    from buddy_proxy.desensitize import desensitize_body
     HAS_DESENSITIZE = True
 except ImportError:
     HAS_DESENSITIZE = False

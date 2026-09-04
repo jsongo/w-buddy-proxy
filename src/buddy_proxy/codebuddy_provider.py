@@ -19,18 +19,18 @@ import httpx
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from codebuddy_proxy.dsml_parser import DSMLStreamBuffer
-from codebuddy_proxy.providers import BaseProvider
-from codebuddy_proxy.state import (
+from buddy_proxy.dsml_parser import DSMLStreamBuffer
+from buddy_proxy.providers import BaseProvider
+from buddy_proxy.state import (
     diagnostic,
     get_state,
     is_policy_blocked,
 )
-from codebuddy_proxy.logging_setup import now_s
+from buddy_proxy.logging_setup import now_s
 
 # 可选高级功能模块（脱敏 / 投影 / 协议转换器）
 try:
-    from codebuddy_proxy.desensitize import desensitize_body
+    from buddy_proxy.desensitize import desensitize_body
     HAS_DESENSITIZE = True
 except ImportError:
     HAS_DESENSITIZE = False
@@ -40,7 +40,7 @@ except ImportError:
 
 
 try:
-    from codebuddy_proxy.responses_projection import project_responses_chat_body
+    from buddy_proxy.responses_projection import project_responses_chat_body
     HAS_PROJECTION = True
 except ImportError:
     HAS_PROJECTION = False
@@ -50,7 +50,7 @@ except ImportError:
 
 
 try:
-    from codebuddy_proxy.responses_adapter import responses_request_to_chat, ResponsesStreamConverter
+    from buddy_proxy.responses_adapter import responses_request_to_chat, ResponsesStreamConverter
     HAS_RESPONSES_ADAPTER = True
 except ImportError:
     HAS_RESPONSES_ADAPTER = False
@@ -62,7 +62,7 @@ except ImportError:
 
 
 try:
-    from codebuddy_proxy.anthropic_adapter import anthropic_to_chat, AnthropicStreamConverter
+    from buddy_proxy.anthropic_adapter import anthropic_to_chat, AnthropicStreamConverter
     HAS_ANTHROPIC_ADAPTER = True
 except ImportError:
     HAS_ANTHROPIC_ADAPTER = False

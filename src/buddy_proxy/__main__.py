@@ -8,9 +8,9 @@ Features:
 - Robust timeout handling with async iterators
 
 Usage with uv:
-    uv run python -m codebuddy_proxy
-    uv run python -m codebuddy_proxy --desensitize
-    uv run python -m codebuddy_proxy --host 0.0.0.0 --port 8787
+    uv run python -m buddy_proxy
+    uv run python -m buddy_proxy --desensitize
+    uv run python -m buddy_proxy --host 0.0.0.0 --port 8787
 
 模块结构（2026-09 拆分）：
 - ``logging_setup``  日志配置与运行时信息工具
@@ -29,24 +29,24 @@ import pathlib
 
 import uvicorn
 
-from codebuddy_proxy.codebuddy_client_demo import CodeBuddyClient
-from codebuddy_proxy.providers import BaseProvider
-from codebuddy_proxy.doubao_provider import DoubaoProvider
-from codebuddy_proxy.logging_setup import setup_logging, setup_json_logging
-from codebuddy_proxy.state import ProxyState, app
-from codebuddy_proxy.model_list import RemoteConfigCache
+from buddy_proxy.codebuddy_client_demo import CodeBuddyClient
+from buddy_proxy.providers import BaseProvider
+from buddy_proxy.doubao_provider import DoubaoProvider
+from buddy_proxy.logging_setup import setup_logging, setup_json_logging
+from buddy_proxy.state import ProxyState, app
+from buddy_proxy.model_list import RemoteConfigCache
 
 # 导入 routes 以注册所有 @app 路由（副作用导入）
-from codebuddy_proxy import routes as _routes  # noqa: F401
+from buddy_proxy import routes as _routes  # noqa: F401
 
 
 def main():
-    import codebuddy_proxy.state as _state
+    import buddy_proxy.state as _state
 
     parser = argparse.ArgumentParser(description="CodeBuddy local API proxy")
-    parser.add_argument("--host", default=os.getenv("CODEBUDDY_PROXY_HOST", "127.0.0.1"),
+    parser.add_argument("--host", default=os.getenv("BUDDY_PROXY_HOST", "127.0.0.1"),
                         help="监听地址")
-    parser.add_argument("--port", type=int, default=int(os.getenv("CODEBUDDY_PROXY_PORT", "8787")),
+    parser.add_argument("--port", type=int, default=int(os.getenv("BUDDY_PROXY_PORT", "8787")),
                         help="监听端口")
     parser.add_argument("--endpoint", default=os.getenv("CODEBUDDY_ENDPOINT", "https://copilot.tencent.com"),
                         help="CodeBuddy 后端地址")
@@ -58,15 +58,15 @@ def main():
     _default_log_dir = pathlib.Path(__file__).resolve().parents[2] / "logs"
     default_log_file = pathlib.Path(
         os.getenv(
-            "CODEBUDDY_PROXY_LOG_FILE",
-            str(_default_log_dir / "codebuddy-proxy.jsonl"),
+            "BUDDY_PROXY_LOG_FILE",
+            str(_default_log_dir / "buddy-proxy.jsonl"),
         )
     ).expanduser()
     parser.add_argument(
         "--log-file",
         type=pathlib.Path,
         default=default_log_file,
-        help="记录完整请求/响应的 JSONL 文件（默认 <项目根>/logs/codebuddy-proxy.jsonl，可用 CODEBUDDY_PROXY_LOG_FILE 覆盖）",
+        help="记录完整请求/响应的 JSONL 文件（默认 <项目根>/logs/buddy-proxy.jsonl，可用 BUDDY_PROXY_LOG_FILE 覆盖）",
     )
     parser.add_argument("--desensitize", action="store_true",
                         help="启用脱敏处理，对 system 消息中的敏感词插入零宽空格（缓解审核误拦）")
@@ -115,7 +115,7 @@ def main():
         print("[Doubao] Disabled (pass --doubao or DOUBAO_ENABLED=1 to enable)")
 
     if args.trae:
-        from codebuddy_proxy.trae_provider import TraeProvider
+        from buddy_proxy.trae_provider import TraeProvider
 
         trae = TraeProvider()
         providers[trae.id] = trae

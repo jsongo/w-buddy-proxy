@@ -2084,10 +2084,10 @@ class TraeProvider(BaseProvider):
 def _cli() -> None:
     """命令行工具：查询/领取积分、测试对话。示例：
 
-    python -m codebuddy_proxy.trae_provider status   # 签到/积分状态
-    python -m codebuddy_proxy.trae_provider claim    # 领取今日签到积分
-    python -m codebuddy_proxy.trae_provider usage    # 权益/用量
-    python -m codebuddy_proxy.trae_provider chat -m glm-5.2 -q "你好"
+    python -m buddy_proxy.trae_provider status   # 签到/积分状态
+    python -m buddy_proxy.trae_provider claim    # 领取今日签到积分
+    python -m buddy_proxy.trae_provider usage    # 权益/用量
+    python -m buddy_proxy.trae_provider chat -m glm-5.2 -q "你好"
     """
     import argparse
 

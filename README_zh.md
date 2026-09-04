@@ -26,13 +26,13 @@
 
 ```bash
 uv sync
-uv run python -m codebuddy_proxy --desensitize
+uv run python -m buddy_proxy --desensitize
 ```
 
 首次使用需要登录（会打开浏览器）：
 
 ```bash
-uv run python -m codebuddy_proxy --login --desensitize
+uv run python -m buddy_proxy --login --desensitize
 ```
 
 默认监听 `http://127.0.0.1:8787`。
@@ -43,7 +43,7 @@ uv run python -m codebuddy_proxy --login --desensitize
 
 ```bash
 # 启用豆包 provider（需要本机已安装并登录豆包工作 App）
-uv run python -m codebuddy_proxy --desensitize --doubao
+uv run python -m buddy_proxy --desensitize --doubao
 ```
 
 - **原理**：复用豆包工作 App 的登录态与内置 Chromium（CDP 直连），在页面 JS 环境 fetch
@@ -59,7 +59,7 @@ uv run python -m codebuddy_proxy --desensitize --doubao
 
 ```bash
 # 启用 Trae provider（需要本机已安装并登录 Trae IDE）
-uv run python -m codebuddy_proxy --desensitize --trae
+uv run python -m buddy_proxy --desensitize --trae
 ```
 
 - **原理**：自动解密 Trae IDE 本地存储的 tc 加密登录态（AES-128-CBC + SHA-512），
@@ -103,16 +103,16 @@ PROXY_PORT=9000 PROXY_EXTRA_ARGS="--desensitize --optimize-context" ./proxy.sh s
 脚本行为：
 - 自动检测 `.venv/bin/python`（优先使用项目 venv）
 - 用 `nohup ... &` 启动，`start` 命令**立即返回**，不会阻塞终端
-- PID 写到 `logs/proxy.pid`，启动输出写到 `logs/proxy.sh.log`；应用日志按天滚动（`logs/proxy.log` 与 `logs/codebuddy-proxy.jsonl`，保留 30 天）
+- PID 写到 `logs/proxy.pid`，启动输出写到 `logs/proxy.sh.log`；应用日志按天滚动（`logs/proxy.log` 与 `logs/buddy-proxy.jsonl`，保留 30 天）
 - 停止用 `kill` 优雅退出；10s 内未退出会 fallback 到 `kill -9`
 
 ## 模型列表
 
-`src/codebuddy_proxy/models_config.json` 维护了完整的静态模型列表，加 `--static-models` 可强制使用它（断网或远程同步失败时很有用）：
+`src/buddy_proxy/models_config.json` 维护了完整的静态模型列表，加 `--static-models` 可强制使用它（断网或远程同步失败时很有用）：
 
 ```bash
 ./proxy.sh start -- --static-models
-# (注意中间的 `--` 分隔，把参数透传给 codebuddy_proxy)
+# (注意中间的 `--` 分隔，把参数透传给 buddy_proxy)
 ```
 
 静态目录当前内置 **11 个模型**，`GET /v1/models` 的 `data[].credits` / `models[].credits` 会返回积分倍率（消费 × 倍率）：
@@ -131,7 +131,7 @@ PROXY_PORT=9000 PROXY_EXTRA_ARGS="--desensitize --optimize-context" ./proxy.sh s
 | `deepseek-v4-flash` | Deepseek-V4-Flash | x0.17 |
 | `deepseek-v4-pro` | Deepseek-V4-Pro | x0.51 |
 
-要新增 / 调整模型，直接编辑 `src/codebuddy_proxy/models_config.json`，加 `--static-models` 重启即生效。
+要新增 / 调整模型，直接编辑 `src/buddy_proxy/models_config.json`，加 `--static-models` 重启即生效。
 
 ## 快速验证
 
@@ -254,7 +254,7 @@ providers:
 --port PORT               绑定端口（默认 8787）
 --endpoint ENDPOINT       CodeBuddy 后端地址
 --session-file PATH       会话文件（默认 ~/.codebuddy-session.json）
---log-file PATH           JSONL 日志（默认 <项目根>/logs/codebuddy-proxy.jsonl，可用 CODEBUDDY_PROXY_LOG_FILE 覆盖）
+--log-file PATH           JSONL 日志（默认 <项目根>/logs/buddy-proxy.jsonl，可用 BUDDY_PROXY_LOG_FILE 覆盖）
 --desensitize             启用脱敏（推荐）
 --optimize-context        启用消息压缩（Codex 场景推荐）
 --login                   启动时浏览器登录
@@ -263,7 +263,7 @@ providers:
 --mock-dir DIR            使用录制的响应（测试用）
 ```
 
-环境变量：`CODEBUDDY_PROXY_HOST`、`CODEBUDDY_PROXY_PORT`、`CODEBUDDY_ENDPOINT`、`CODEBUDDY_PROXY_LOG_FILE`。
+环境变量：`BUDDY_PROXY_HOST`、`BUDDY_PROXY_PORT`、`CODEBUDDY_ENDPOINT`、`BUDDY_PROXY_LOG_FILE`。
 
 ## API 端点
 

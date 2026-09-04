@@ -1,11 +1,11 @@
 """回归验证：ethan 会话 s_20260903_1613_155c 实测 badcase。
 
-用例全部取自 2026-09-03 codebuddy-proxy.jsonl 的真实 upstream 输出。
+用例全部取自 2026-09-03 buddy-proxy.jsonl 的真实 upstream 输出。
 """
 import sys
 
 sys.path.insert(0, "src")
-from codebuddy_proxy.trae_provider import (  # noqa: E402
+from buddy_proxy.trae_provider import (  # noqa: E402
     _parse_tool_calls,
     _sanitize_agent_leak,
     _StreamToolCallSplitter,

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# proxy.sh - manage the w-buddy-proxy (codebuddy_proxy) FastAPI server
+# proxy.sh - manage the w-buddy-proxy (buddy_proxy) FastAPI server
 #
 # Usage:
 #   ./proxy.sh start    [-p PORT] [-H HOST]     # 后台启动 (默认 0.0.0.0:8787，局域网可访问)
@@ -9,7 +9,7 @@
 #   ./proxy.sh logs                              # 跟踪日志
 #
 # 支持环境变量（start 命令生效）：
-#   PROXY_PORT, PROXY_HOST, PROXY_EXTRA_ARGS (附加传给 python -m codebuddy_proxy)
+#   PROXY_PORT, PROXY_HOST, PROXY_EXTRA_ARGS (附加传给 python -m buddy_proxy)
 
 set -euo pipefail
 
@@ -89,10 +89,10 @@ cmd_start() {
     # nohup + & : 立刻返回，不阻塞
     # 走源文件 src/ 运行，避开本机 setuptools env 的 EEXIST 环境 bug（uv sync 构建可编辑安装时触发）
     PYTHONPATH="$SCRIPT_DIR/src" \
-    nohup $PYTHON_BIN -m codebuddy_proxy \
+    nohup $PYTHON_BIN -m buddy_proxy \
         --host "$PROXY_HOST" \
         --port "$PROXY_PORT" \
-        --log-file "$LOG_DIR/codebuddy-proxy.jsonl" \
+        --log-file "$LOG_DIR/buddy-proxy.jsonl" \
         --static-models \
         $EXTRA_ARGS \
         >>"$LOG_FILE" 2>&1 &
@@ -156,7 +156,7 @@ cmd_status() {
         local port="${actual:-$PROXY_PORT}"
         log "running (pid=$pid, $host:$port)"
         log "shell log: $LOG_FILE"
-        log "jsonl log: $LOG_DIR/codebuddy-proxy.jsonl"
+        log "jsonl log: $LOG_DIR/buddy-proxy.jsonl"
         return 0
     fi
     log "not running (pid_file=${pid:-none})"
