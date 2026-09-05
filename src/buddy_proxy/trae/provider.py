@@ -18,18 +18,19 @@ from ..anthropic_adapter import chat_completion_to_anthropic_message
 from ..providers import BaseProvider
 from .benefits_api import claim_checkin_credits, fetch_checkin_status, fetch_ent_usage
 from .config import (
+    BASE_URL_CN,
     MODEL_MAP,
     MODEL_TIERS,
     TRAE_HEARTBEAT_INTERVAL,
+    _NATIVE_TOOLS_ENABLED,
     _debug_dump,
     _heartbeat_text,
-    _map_model,
 )
 from .credentials import _auth
 from .leak_guard import _StreamLeakCleaner, _sanitize_agent_leak
 from .native_tools import (
     _NativeToolAccumulator,
-    _NATIVE_TOOLS_ENABLED,
+    _native_messages,
     _native_rejected,
     _send_native_chat,
 )
@@ -222,7 +223,6 @@ class TraeProvider(BaseProvider):
         """把 Trae SSE 转成 OpenAI chat.completion.chunk 流。"""
         request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
-        in_thinking = False
         usage: dict[str, Any] | None = None
 
         def chunk(delta: dict[str, Any], finish: str | None = None) -> str:
@@ -330,7 +330,6 @@ class TraeProvider(BaseProvider):
                     return
                 if event == "output":
                     if data.get("reasoning_content"):
-                        in_thinking = True
                         yield chunk({"reasoning_content": data["reasoning_content"]})
                     if acc is not None:
                         # 原生通道：tool_calls 按结构化事件累积，正文不经
@@ -341,7 +340,6 @@ class TraeProvider(BaseProvider):
                         if text:
                             dbg_parts.append(text)
                             yield chunk({"role": "assistant", "content": text})
-                            in_thinking = False
                     elif data.get("response"):
                         text = data["response"]
                         if cleaner is not None:
@@ -351,7 +349,6 @@ class TraeProvider(BaseProvider):
                         if text:
                             dbg_parts.append(text)
                             yield chunk({"role": "assistant", "content": text})
-                            in_thinking = False
                 elif event == "token_usage":
                     u = data or {}
                     try:

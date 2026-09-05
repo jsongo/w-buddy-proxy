@@ -18,7 +18,9 @@ from typing import Any
 from fastapi import HTTPException
 
 from .config import BASE_URL_CN, _NATIVE_FUNCTION, _map_model
-from .credentials import _build_headers, _load_work_cred, _work_headers
+from .credentials import _auth, _build_headers, _load_work_cred, _work_headers
+from .sse import _parse_sse
+from .text_protocol import _content_blocks
 
 log = logging.getLogger(__name__)
 

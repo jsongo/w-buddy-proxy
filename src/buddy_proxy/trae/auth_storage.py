@@ -8,11 +8,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
-import re
 import sys
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 # ───────────────────────── tc 加密解密 ─────────────────────────
 
@@ -72,8 +74,6 @@ def decrypt_storage_value(base64_value: str) -> str:
     结构: [6B Header][32B RandomBytes][N EncryptedData]
     解密: [64B SHA-512 Hash][N Plaintext JSON]
     """
-    import base64
-
     buf = base64.b64decode(base64_value)
     header = buf[:6]
     random_bytes = buf[6:38]

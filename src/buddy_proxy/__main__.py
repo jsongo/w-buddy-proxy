@@ -146,7 +146,7 @@ def main():
         print("[Doubao] Disabled (pass --doubao or DOUBAO_ENABLED=1 to enable)")
 
     if args.trae:
-        from buddy_proxy.trae_provider import TraeProvider
+        from buddy_proxy.trae.provider import TraeProvider
 
         trae = TraeProvider()
         providers[trae.id] = trae
