@@ -29,13 +29,59 @@ from .providers import BaseProvider
 
 log = logging.getLogger(__name__)
 
-# 豆包文本对话模型 -> use_deep_think 模式（0=快速, 1=思考, 3=专家）
-_DOUBAO_CHAT_MODELS: dict[str, tuple[str, int]] = {
-    "doubao": ("豆包快速模式", 0),
-    "doubao-pro": ("豆包 Pro", 0),
-    "doubao-think": ("豆包深度思考", 1),
-    "doubao-expert": ("豆包专家模式", 3),
+# 豆包文本对话模型表。
+#
+# 两类条目（2026-09 对豆包工作 App 抓包实测，见 cdp_client._build_agent_payload）：
+# - 经典管线（``deep_think``）：服务端忽略一切模型字段，固定路由到当前默认
+#   豆包模型，仅 ``use_deep_think``（0=快速, 1=思考, 3=专家）有效；
+# - agent 管线（``agent``）：与 App 模型菜单同款协议（``model_item_key`` 等），
+#   实测可路由到菜单里的具体模型。item_key 来自 App 前端 modelItems 注册表。
+_DOUBAO_CHAT_MODELS: dict[str, dict[str, Any]] = {
+    # ---- 经典管线 ----
+    "doubao": {"desc": "豆包（默认模型快速模式）", "deep_think": 0},
+    # 旧别名：历史上并非真的 Pro 模型（经典管线固定默认模型），真 Pro 用
+    # ``doubao-2.1-pro``。保留仅为兼容老客户端。
+    "doubao-pro": {"desc": "豆包（旧别名，等同 doubao）", "deep_think": 0},
+    "doubao-think": {"desc": "豆包深度思考", "deep_think": 1},
+    "doubao-expert": {"desc": "豆包专家模式", "deep_think": 3},
+    # ---- agent 管线（App 模型菜单同款）----
+    "doubao-auto": {
+        "desc": "豆包自动（App「自动」智能路由）",
+        "agent": {"item_key": "9", "extra": {"total_window_size": "256000"}, "provider": ""},
+    },
+    "doubao-2.1-turbo": {
+        "desc": "豆包 2.1 Turbo（App 同款）",
+        "agent": {"item_key": "4", "extra": {"total_window_size": "256000"}, "provider": ""},
+    },
+    "doubao-2.1-pro": {
+        "desc": "豆包 2.1 Pro（App 同款，额度消耗更快）",
+        "agent": {"item_key": "5", "extra": {"total_window_size": "256000"}, "provider": ""},
+    },
+    "orange-5.0": {
+        "desc": "Orange 5.0（App 同款，支持极高/最高推理强度）",
+        "agent": {"item_key": "6", "extra": {"total_window_size": "256000"}, "provider": ""},
+    },
+    "gemini-3.7-flash": {
+        "desc": "Gemini 3.7 Flash（豆包 App 内提供的第三方模型）",
+        "agent": {
+            "item_key": "1946880770",
+            "extra": {"memory_profile": "256k", "provider_id": "cis", "total_window_size": "256000"},
+            "provider": "cis",
+        },
+    },
+    "gpt-5.6-sol": {
+        "desc": "GPT-5.6 Sol（豆包 App 内提供的第三方模型）",
+        "agent": {
+            "item_key": "2123520258",
+            "extra": {"memory_profile": "256k", "provider_id": "cis", "total_window_size": "256000"},
+            "provider": "cis",
+        },
+    },
 }
+
+# agent 管线默认推理强度（3=低 4=中 5=高 6=极高 7=最高），可被请求体
+# ``reasoning_effort`` 字段按模型覆盖
+_DEFAULT_REASONING_EFFORT = 5
 
 
 def _extract_prompt(messages: list[dict[str, Any]]) -> str:
@@ -95,9 +141,9 @@ class DoubaoProvider(BaseProvider):
                 "object": "model",
                 "owned_by": self.id,
                 "created": 0,
-                "description": desc,
+                "description": spec["desc"],
             }
-            for mid, (desc, _) in _DOUBAO_CHAT_MODELS.items()
+            for mid, spec in _DOUBAO_CHAT_MODELS.items()
         ]
 
     def ensure_auth(self) -> None:
@@ -145,7 +191,18 @@ class DoubaoProvider(BaseProvider):
                 status_code=400,
                 detail=f"unknown doubao model '{requested_model}'",
             )
-        _, use_deep_think = _DOUBAO_CHAT_MODELS[requested_model]
+        spec = _DOUBAO_CHAT_MODELS[requested_model]
+        model_spec: dict[str, Any] | None = None
+        if "agent" in spec:
+            # agent 管线：复制一份避免请求间共享可变默认值，
+            # reasoning_effort 允许客户端按请求覆盖（3低/4中/5高/6极高/7最高）
+            model_spec = dict(spec["agent"])
+            effort = body.get("reasoning_effort")
+            if isinstance(effort, int) and 3 <= effort <= 7:
+                model_spec["reasoning_effort"] = effort
+            else:
+                model_spec.setdefault("reasoning_effort", _DEFAULT_REASONING_EFFORT)
+        use_deep_think = spec.get("deep_think", 0)
 
         messages = body.get("messages", [])
         prompt = _extract_prompt(messages)
@@ -160,12 +217,14 @@ class DoubaoProvider(BaseProvider):
                 (body.get("stream_options") or {}).get("include_usage"))
             return StreamingResponse(
                 self._stream(prompt, use_deep_think, requested_model,
-                             conversation_id, bot_id, include_usage),
+                             conversation_id, bot_id, include_usage,
+                             model_spec=model_spec),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "Connection": "close"},
             )
 
-        message = await self._collect(prompt, use_deep_think, conversation_id, bot_id)
+        message = await self._collect(prompt, use_deep_think, conversation_id,
+                                      bot_id, model_spec=model_spec)
         return JSONResponse(content=self._build_nonstream_response(message, requested_model))
 
     def health(self) -> dict[str, Any]:
@@ -220,6 +279,7 @@ class DoubaoProvider(BaseProvider):
         conversation_id: str | None,
         bot_id: str | None,
         include_usage: bool = False,
+        model_spec: dict[str, Any] | None = None,
     ) -> AsyncIterator[str]:
         """把豆包原始 SSE 事件转成 OpenAI chat.completion.chunk 流。"""
         request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
@@ -250,6 +310,7 @@ class DoubaoProvider(BaseProvider):
                 use_deep_think=use_deep_think,
                 conversation_id=conversation_id or None,
                 bot_id=bot_id or None,
+                model_spec=model_spec,
             ):
                 if event.get("error"):
                     status = event.get("status", 0)
@@ -344,6 +405,7 @@ class DoubaoProvider(BaseProvider):
         use_deep_think: int,
         conversation_id: str | None,
         bot_id: str | None,
+        model_spec: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """非流式：聚合完整响应，分离 reasoning_content 与 content。"""
         thinking_count = 0
@@ -366,6 +428,7 @@ class DoubaoProvider(BaseProvider):
                 use_deep_think=use_deep_think,
                 conversation_id=conversation_id or None,
                 bot_id=bot_id or None,
+                model_spec=model_spec,
             ):
                 if event.get("error"):
                     self._client.record_failure(event.get("status") or 0)

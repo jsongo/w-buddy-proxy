@@ -71,7 +71,12 @@ uv run python -m buddy_proxy --desensitize --doubao
 
 - **原理**：复用豆包工作 App 的登录态与内置 Chromium（CDP 直连），在页面 JS 环境 fetch
   自动注入 a_bogus 风控签名，无需扫码、无需额外凭证
-- **模型**：`doubao`（快速）、`doubao-pro`、`doubao-think`（深度思考）、`doubao-expert`（专家）
+- **模型**：
+  - 经典通道：`doubao`（默认模型快速）、`doubao-pro`（旧别名）、`doubao-think`（深度思考）、
+    `doubao-expert`（专家）——服务端固定路由到当前默认豆包模型
+  - agent 通道（App 模型菜单同款，2026-09 实测）：`doubao-auto`（App「自动」）、
+    `doubao-2.1-turbo`、`doubao-2.1-pro`、`orange-5.0`、`gemini-3.7-flash`、`gpt-5.6-sol`；
+    请求体可带 `reasoning_effort`（3低/4中/5高/6极高/7最高，默认 5）
 - **依赖**：纯 Python 标准库，不需要 Playwright / chromium
 - **CDP 模式**：默认优先复用主 App（`open -a DoubaoWork --args --remote-debugging-port=9223`，
   不杀用户进程）；主 App 不可用时回退独立 Helper
@@ -351,9 +356,9 @@ providers:
 | 接口 | 说明 |
 | --- | --- |
 | `CDPDoubaoClient.start()` | 确保 CDP：优先复用主 App（`open -a DoubaoWork --args --remote-debugging-port=9223`，不杀进程），兜底独立 Helper |
-| `CDPDoubaoClient.chat_completion()` | 页面内 fetch `/chat/completion`（自动带 a_bogus 签名），流式 yield SSE |
+| `CDPDoubaoClient.chat_completion()` | 页面内 fetch `/chat/completion`（自动带 a_bogus 签名），流式 yield SSE；`model_spec` 传入时走 agent 管线（`_build_agent_payload`，App 同款 `model_item_key` 路由），否则经典管线 |
 | `DoubaoProvider.forward()` | 流式 / 非流式转换，返回 OpenAI 标准格式 |
-| 模型 | `doubao`（快速）/ `doubao-pro` / `doubao-think`（深度思考）/ `doubao-expert`（专家） |
+| 模型 | 经典：`doubao`（快速）/ `doubao-pro`（旧别名）/ `doubao-think`（深度思考）/ `doubao-expert`（专家）；agent（App 菜单同款）：`doubao-auto` / `doubao-2.1-turbo` / `doubao-2.1-pro` / `orange-5.0` / `gemini-3.7-flash` / `gpt-5.6-sol` |
 | 依赖 | 纯 Python 标准库，无 Playwright / chromium |
 
 ### 3. Trae Provider（`trae/` 子包 + `trae_work_login*.py`）
