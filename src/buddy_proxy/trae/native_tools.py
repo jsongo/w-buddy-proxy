@@ -140,7 +140,7 @@ def _build_native_body(
     tools: list[dict[str, Any]] | None,
 ) -> dict[str, Any]:
     session_id = str(uuid.uuid4())
-    return {
+    body = {
         "messages": native_msgs,
         "model": trae_model,
         "config_name": trae_model,
@@ -148,8 +148,12 @@ def _build_native_body(
         "stream": stream,
         "request_id": session_id,
         "session_id": session_id,
-        "tools": _native_tools_payload(tools),
     }
+    tools_payload = _native_tools_payload(tools)
+    if tools_payload:
+        # 纯聊天请求不带 tools 键（实测裸请求与空数组均可，省略更干净）
+        body["tools"] = tools_payload
+    return body
 
 
 def _send_native_chat(

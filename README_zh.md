@@ -89,10 +89,10 @@ uv run python -m buddy_proxy --desensitize --trae
   或从 `.env` 读 `TRAE_TOKEN` / `TRAE_USER_ID`，直连 `trae-api-cn.mchost.guru`
 - **模型**：T1-T5 分级（glm-5.2 / qwen-3.7-plus / kimi-k2.6 / DeepSeek-V4-Pro 等），
   支持外部名别名（如 `claude-sonnet-4-5` → `glm-5.2`）
-- **原生 function calling（2026-09 起）**：带 `tools` 的请求默认走原生通道
-  （`chat_v3` 直通，结构化 `tool_calls` 与多轮 `role:"tool"` 历史回放），
-  实测 17 个模型 16 个原生可用（仅 glm-5-turbo 不在通道，自动回落文本协议）；
-  原生通道还带真实 token usage
+- **原生通道（2026-09 起）**：全部请求（含纯聊天）默认走 `chat_v3` 直通——
+  带 `tools` 时为原生 function calling（结构化 `tool_calls` + `role:"tool"` 历史回放），
+  纯聊天无服务端 agent 预设、不再注入压制指令与泄漏清洗；实测 17 个模型
+  16 个原生可用（仅 glm-5-turbo 不在通道，自动回落文本协议）；通道还带真实 token usage
 - **依赖**：纯 Python 标准库（含零依赖 AES 兜底实现），不需要 Node.js
 - **注意**：免费账号有日/周调用额度，耗尽时报 `4011`（今日用量已达上限），
   错误会以友好中文文案透传

@@ -344,3 +344,38 @@ def test_native_shim_getattr_compat():
     assert callable(tp_shim._gate_tool_name)
     with pytest.raises(AttributeError):
         tp_shim._definitely_not_a_name
+
+
+# ---------------------------------------------------------------------------
+# 纯聊天（无 tools）也走原生通道：无 guard 注入、无 tools 键
+# ---------------------------------------------------------------------------
+def test_native_pure_chat_no_guard(client, native_env):
+    state, native_calls, legacy_calls = native_env
+    state._native_sse = _native_sse([{"response": "你好！"}])
+    r = client.post("/v1/chat/completions", json=_chat_body(stream=False, tools=False))
+    assert r.status_code == 200
+    resp = r.json()
+    assert resp["choices"][0]["finish_reason"] == "stop"
+    assert "你好" in resp["choices"][0]["message"]["content"]
+    assert len(native_calls) == 1 and legacy_calls == []
+    # chat_v3 无 agent 预设：不注入 guard 压制指令
+    assert all("Command" not in json.dumps(msg, ensure_ascii=False)
+               for msg in native_calls[0]["messages"])
+    # 纯聊天不带 tools 键
+    assert native_calls[0]["tools"] == []
+
+
+def test_native_pure_chat_4001_falls_back_with_guard(client, native_env):
+    """纯聊天 4001 回落文本协议时，legacy prompt 需带 guard（防预设泄漏）。"""
+    state, native_calls, legacy_calls = native_env
+    state._native_sse = SSE_NATIVE_REJECTED
+    state._legacy_sse = (
+        'event: output\ndata: {"response": "你好！"}\n\n'
+        "event: done\ndata: {}\n\n")
+    r = client.post("/v1/chat/completions", json=_chat_body(stream=False, tools=False))
+    assert r.status_code == 200
+    assert "你好" in r.json()["choices"][0]["message"]["content"]
+    assert len(native_calls) == 1 and len(legacy_calls) == 1
+    # 回落路径注入 guard 压制指令（solo_work_lite 服务端预设会漏 Command 语法）
+    assert any("Command" in json.dumps(msg, ensure_ascii=False)
+               for msg in legacy_calls[0]["messages"])

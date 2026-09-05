@@ -161,10 +161,11 @@ class TraeProvider(BaseProvider):
         )
 
         tools = body.get("tools") or []
-        # 原生 function calling 通道：带 tools 的请求优先走结构化直通
-        # （chat_v3 + 原生 tools），上游 4001 拒绝时自动回落文本协议。
-        # prompt（文本协议转换）始终照算——它是兜底路径的输入。
-        native_mode = bool(tools) and _NATIVE_TOOLS_ENABLED
+        # 原生通道：全部请求（含纯聊天）默认走 chat_v3 直通——该通道无 agent
+        # 预设，纯聊天不再需要 guard 注入与泄漏清洗。上游 4001 拒绝时自动回落
+        # 文本协议（prompt 始终照算，它就是兜底路径的输入：纯聊天带 guard、
+        # 工具请求带教学）。
+        native_mode = _NATIVE_TOOLS_ENABLED
         prompt = _extract_prompt(
             messages, guard=not agent_mode, tools=tools if agent_mode else None
         )
