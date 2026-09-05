@@ -375,6 +375,23 @@ def claim_checkin_credits(token: str = "", account_id: str = "") -> dict[str, An
     return _post_ug("/trae/api/v2/ug/checkin_credits/claim", token, account_id)
 
 
+def fetch_ent_usage(token: str = "", account_id: str = "") -> dict[str, Any]:
+    """查询权益/额度用量（ide_user_ent_usage：总额度 + 权益包列表）。"""
+    if not token:
+        token, _ = _auth()
+    headers = _build_checkin_headers(token, account_id)
+    headers["X-User-Region"] = "CN"
+    req = urllib.request.Request(
+        _UG_API_HOST + "/trae/api/v2/pay/ide_user_ent_usage",
+        data=b"{}", headers=headers, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Trae usage [{e.code}]: {e.read().decode()[:300]}")
+
+
 # ───────────────────────── Trae API 调用 ─────────────────────────
 
 def _build_headers(token: str, user_id: str) -> dict[str, str]:
@@ -2669,6 +2686,8 @@ def _wrap_anthropic_stream(
 class TraeProvider(BaseProvider):
     id = "trae"
     name = "Trae (本地解密直连)"
+    # 打卡/积分 API 只有 Trae 上游提供（/ui 自动打卡据此识别）
+    supports_checkin = True
 
     def __init__(self, base_url: str | None = None, edition: str = "cn"):
         self._base_url = base_url or BASE_URL_CN
@@ -2706,6 +2725,62 @@ class TraeProvider(BaseProvider):
 
     def ensure_auth(self) -> None:
         _auth()
+
+    # ---- 打卡 / 额度（/ui 管理页消费，均经 asyncio.to_thread 调用） ----
+
+    def checkin_status(self) -> dict[str, Any] | None:
+        data = fetch_checkin_status()
+        checked_in = bool(data.get("checked_in"))
+        return {
+            "checked_in": checked_in,
+            "claimable": bool(data.get("enable", True)) and not checked_in,
+            "inactive": not bool(data.get("enable", True)),
+            "message": data.get("message", ""),
+        }
+
+    def checkin_claim(self) -> dict[str, Any] | None:
+        data = claim_checkin_credits()
+        if data.get("code") not in (0, None):
+            raise RuntimeError(data.get("message") or json.dumps(data, ensure_ascii=False)[:200])
+        return {
+            "checked_in": True,
+            "extra_credits": data.get("credits_granted", data.get("extra_credits")),
+            "message": data.get("message", ""),
+        }
+
+    def quota(self) -> dict[str, Any] | None:
+        data = fetch_ent_usage()
+        us = data.get("usage_summary", {})
+        items: list[dict[str, Any]] = []
+        total, consumed = us.get("total_amount"), us.get("consumed_amount")
+        if total is not None:
+            ratio = us.get("consumption_ratio")
+            percent = round(ratio * 100) if isinstance(ratio, (int, float)) else None
+            remaining = None
+            if isinstance(total, (int, float)) and isinstance(consumed, (int, float)):
+                remaining = round(total - consumed, 2)
+            items.append({"label": "总额度", "used": consumed, "total": total,
+                          "remaining": remaining, "percent": percent, "reset_ts": None})
+        # 权益包列表可能带几十条历史"签到奖励"空记录，只保留有到期时间的前几个
+        packs: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for p in data.get("user_entitlement_pack_list", []):
+            eb = p.get("entitlement_base_info") or {}
+            if not eb.get("end_time"):
+                continue
+            desc = p.get("display_desc") or "权益包"
+            if desc in seen:
+                continue
+            seen.add(desc)
+            packs.append({
+                "label": desc,
+                "used": None, "total": None, "percent": None,
+                "reset_ts": eb.get("end_time"),
+            })
+            if len(packs) >= 3:
+                break
+        items.extend(packs)
+        return {"items": items, "level": None}
 
     async def forward(
         self,
@@ -3048,15 +3123,7 @@ def _cli() -> None:
             if not token:
                 print("Trae 未认证：请先运行 trae_work_login.py 登录，或设置 TRAE_TOKEN 环境变量")
                 return
-        headers = _build_headers(token, uid)
-        headers["Accept"] = "application/json"
-        headers["X-User-Region"] = "CN"
-        req = urllib.request.Request(
-            _UG_API_HOST + "/trae/api/v2/pay/ide_user_ent_usage",
-            data=b"{}", headers=headers, method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        data = fetch_ent_usage(token, uid)
         us = data.get("usage_summary", {})
         print(f"总额度: {us.get('total_amount')} | 已用: {us.get('consumed_amount')} "
               f"({us.get('consumption_ratio', 0) * 100:.1f}%)")

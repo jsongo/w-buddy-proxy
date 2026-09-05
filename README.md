@@ -9,6 +9,7 @@
 ## Features
 
 - **Protocol conversion** — `/v1/chat/completions` (OpenAI), `/v1/responses` (Codex CLI), `/v1/messages` (Anthropic / Claude Code)
+- **Admin UI** — built-in web console at `/ui`: browse models grouped by provider, one-click "set as default model", one-click test per model (sends a "hi"), and per-model request stats with charts
 - **Model list** — `/v1/models` returns an OpenAI-compatible model list plus rich per-model metadata (context window, capabilities)
 - **Desensitization** (`--desensitize`) — inserts zero-width spaces into compliance terms inside system messages to avoid backend false-blocking by keyword review
 - **Message compression** (`--optimize-context`) — compresses long histories / large schemas / oversized tool output for `/v1/responses`, cutting token usage dramatically
@@ -28,14 +29,40 @@ uv sync
 uv run python -m buddy_proxy --desensitize
 ```
 
-Or use the convenient management script `proxy.sh` (recommended for background use):
+### The `buddy` command (recommended)
+
+`buddy` is the day-to-day entry point: one command starts the proxy and opens the admin UI. It can also register the proxy as a macOS launchd service (auto-start at login, automatic restart on crash).
 
 ```bash
-./proxy.sh start          # foreground-friendly start (background, no blocking)
+./buddy start              # start (if not running) and open http://127.0.0.1:8787/ui
+./buddy stop / restart / status / logs
+./buddy login [provider]   # upstream login (codebuddy(=workbuddy)/trae/zcode/doubao)
+./buddy ui                 # just open the admin UI (starts the proxy if needed)
+
+# one-time install: put buddy on your PATH so it works from anywhere
+./buddy install            # -> /usr/local/bin (falls back to ~/.local/bin)
+
+# register as a system service (launchd)
+./buddy service install    # start/stop/restart now route through launchctl
+./buddy service status
+./buddy service uninstall
+```
+
+- When the service is installed, `buddy start/stop/restart` automatically use `launchctl`; otherwise they fall back to `proxy.sh`'s pid management.
+- Env vars `PROXY_HOST` (default `0.0.0.0`), `PROXY_PORT` (default `8787`) and `PROXY_EXTRA_ARGS` apply to both `start` and `service install`.
+
+### The `proxy.sh` management script
+
+`buddy` calls `proxy.sh` internally; you can drive it directly for finer control:
+
+```bash
+./proxy.sh start          # background start, returns immediately
 ./proxy.sh stop           # stop the running instance
 ./proxy.sh restart        # restart (with the same args)
 ./proxy.sh status         # show PID and listening address
 ./proxy.sh logs           # tail -F the log file
+./proxy.sh ui             # ensure it's running, then open the admin UI
+./proxy.sh login codebuddy  # upstream login (also: trae / zcode / doubao)
 
 # customize host / port / args
 ./proxy.sh start -p 9000 -H 0.0.0.0
@@ -52,14 +79,7 @@ The script:
 
 ## Models
 
-Both static (`src/buddy_proxy/models_config.json`) and remote model lists are supported. Use `--static-models` to force the built-in list (useful when offline or behind an unsynced remote):
-
-```bash
-./proxy.sh start -- --static-models
-# (note the `--` separator so proxy.sh passes it through)
-```
-
-The static catalog currently ships **11 models** with their credit multiplier (× base cost). `GET /v1/models` → `data[].credits` / `models[].credits` exposes the multiplier:
+The model catalog is maintained in `src/buddy_proxy/models_config.json` — `/v1/models` always serves it (offline-reliable, no remote dependency). The catalog currently ships **11 models** with their credit multiplier (× base cost). `GET /v1/models` → `data[].credits` / `models[].credits` exposes the multiplier:
 
 | id | name | credits |
 |---|---|---|
@@ -75,7 +95,7 @@ The static catalog currently ships **11 models** with their credit multiplier (�
 | `deepseek-v4-flash` | Deepseek-V4-Flash | x0.17 |
 | `deepseek-v4-pro` | Deepseek-V4-Pro | x0.51 |
 
-Edit `src/buddy_proxy/models_config.json` to add or tweak entries — the static list is loaded at startup when `--static-models` is passed (or when remote fetch fails).
+Edit `src/buddy_proxy/models_config.json` to add or tweak entries — changes take effect on restart.
 
 First-time login (opens a browser):
 
@@ -83,9 +103,7 @@ First-time login (opens a browser):
 uv run python -m buddy_proxy --login --desensitize
 ```
 
-It listens on `http://127.0.0.1:8787` by default.
-
-> A handy `start.sh` is included: `uv run python -m buddy_proxy --desensitize --port 8787`.
+It listens on `http://127.0.0.1:8787` by default; the admin UI lives at **http://127.0.0.1:8787/ui** — see [Admin UI](#admin-ui-ui) below.
 
 ## Quick check
 
@@ -93,6 +111,21 @@ It listens on `http://127.0.0.1:8787` by default.
 curl http://127.0.0.1:8787/health      # service + auth status
 curl http://127.0.0.1:8787/v1/models    # model list
 ```
+
+## Admin UI (`/ui`)
+
+Open <http://127.0.0.1:8787/ui> in a browser (or just run `buddy start` / `buddy ui`):
+
+- **Default model** — models are grouped by provider; click "Set as default" (设为默认) on any model to make it the proxy default. Client requests **without a `model` field** are routed to it automatically. Settings persist in `~/.buddy-proxy/settings.json` (override via `BUDDY_PROXY_SETTINGS`) and survive restarts; `--default-model zcode/glm-5.3` seeds the initial value (an existing settings file wins).
+- **One-click test** — every model row has a "Test" (测试) button that sends a real `hi` upstream and shows latency, token usage and the reply preview (non-streaming, `max_tokens=256` — a real, billable upstream call).
+- **Stats & charts** — per-provider/per-model request counts, errors, average latency and token usage: a 14-day stacked daily chart, a top-models bar list, and the latest 50 requests. Each completed request appends one line to `logs/metrics.jsonl`; the tail is reloaded on startup so history survives restarts (30 days kept).
+- **Provider health** — login/config status at a glance (CodeBuddy session, zcode key, ...).
+- **Auto check-in & calendar** — both Trae and CodeBuddy expose daily sign-in: tick "Auto check-in" (自动打卡) and the proxy claims them every day at the configured time (default 09:30; if the proxy starts later it catches up immediately). The last 35 days are shown as a calendar; "Check in now" (立即打卡) claims manually. Campaigns can be seasonal — when CodeBuddy's is closed the UI shows "no sign-in activity today" and skips it. History is appended to `logs/checkin.jsonl`. ZCode (GLM Coding Plan) / Doubao have no sign-in API.
+- **Quota** — remaining allowance per provider at a glance: CodeBuddy credit packs (total remaining + per-pack detail), Trae total allowance + entitlement pack expiry, ZCode 5-hour / weekly windows with reset times. Quota responses are cached for 5 minutes.
+
+The admin UI also lets you switch the **fallback provider** (used when a request matches no model); it persists in the same settings file.
+
+Security: the `/ui/api/*` admin endpoints are **restricted to localhost (127.0.0.1)**. To manage the proxy from the LAN, set `BUDDY_PROXY_ADMIN_OPEN=1` (at your own risk). `/v1/*` proxy endpoints are unaffected.
 
 ## Connect clients
 
@@ -211,18 +244,23 @@ providers:
 --log-file PATH           JSONL log (default <project>/logs/buddy-proxy.jsonl, override via BUDDY_PROXY_LOG_FILE)
 --desensitize             enable desensitization (recommended)
 --optimize-context        enable message compression (recommended for Codex)
+--default-model MODEL     default model, e.g. zcode/glm-5.3; used when a request has no `model`
+                          field. Seeded into the settings file on first start; afterwards
+                          ~/.buddy-proxy/settings.json (editable from the admin UI) wins
 --login                   browser login at startup
 --no-browser              don't auto-open the browser on login
 --verbose-llm             log full request/response bodies
 --mock-dir DIR            serve recorded fixtures (testing)
 ```
 
-Env vars: `BUDDY_PROXY_HOST`, `BUDDY_PROXY_PORT`, `CODEBUDDY_ENDPOINT`, `BUDDY_PROXY_LOG_FILE`, `WB_TRAE_HEARTBEAT_INTERVAL` (Trae stream heartbeat while waiting for the buffered upstream response, seconds, default 45, `0` disables — keeps clients with per-chunk timeouts like Ethan's 120s from aborting long generations).
+Env vars: `BUDDY_PROXY_HOST`, `BUDDY_PROXY_PORT`, `CODEBUDDY_ENDPOINT`, `BUDDY_PROXY_LOG_FILE`, `BUDDY_PROXY_SETTINGS` (settings file path), `BUDDY_PROXY_ADMIN_OPEN=1` (lift the localhost-only restriction on admin endpoints), `WB_TRAE_HEARTBEAT_INTERVAL` (Trae stream heartbeat while waiting for the buffered upstream response, seconds, default 45, `0` disables — keeps clients with per-chunk timeouts like Ethan's 120s from aborting long generations).
 
 ## API endpoints
 
 | Method | Path | Purpose |
 | --- | --- | --- |
+| GET  | `/ui`                 | admin UI (`/` 302-redirects here) |
+| GET  | `/ui/api/*`           | admin API (overview / models / stats / benefits / settings / checkin / test, localhost only) |
 | GET  | `/health`             | service + auth status |
 | GET  | `/v1/models`          | model list |
 | POST | `/v1/chat/completions` | OpenAI chat (tools + streaming) |

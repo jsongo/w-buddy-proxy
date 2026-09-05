@@ -109,6 +109,8 @@ class CodeBuddyProvider(BaseProvider):
 
     id = "codebuddy"
     name = "CodeBuddy"
+    # WorkBuddy/CodeBuddy IDE 提供每日签到（billing/meter，2026-09 从 IDE asar 反查）
+    supports_checkin = True
 
     def models(self) -> list[dict[str, Any]]:
         # CodeBuddy 的模型列表由 /v1/models 统一从本地配置加载，
@@ -118,6 +120,97 @@ class CodeBuddyProvider(BaseProvider):
     def ensure_auth(self) -> None:
         state = get_state()
         state.ensure_auth()
+
+    # ---- 打卡 / 额度（/ui 管理页消费，均经 asyncio.to_thread 调用） ----
+    # 端点来自 WorkBuddy IDE asar 反查（2026-09）：Desktop 走 /v2 前缀的 IDE 网关。
+    # ⚠️ 签到状态必须用 checkin-activity-status（活动版）——不带 /v2 的
+    # checkin-status 是另一个（web/cookie）变体，Bearer 调用只会返回全空数据。
+    # 签到活动有档期（如「开学季」9/1-9/15），active=false 表示当前档期未开。
+
+    def checkin_status(self) -> dict[str, Any] | None:
+        state = get_state()
+        state.ensure_auth()
+        payload = state.client.api_post("/v2/billing/meter/checkin-activity-status")
+        if payload.get("code") not in (0, None):
+            raise RuntimeError(payload.get("msg") or f"code={payload.get('code')}")
+        data = payload.get("data") or {}
+        active = bool(data.get("active"))
+        checked_in = bool(data.get("today_checked_in"))
+        return {
+            "checked_in": checked_in,
+            "claimable": active and not checked_in,
+            "inactive": not active,
+            "streak_days": data.get("streak_days") or 0,
+            "daily_credit": data.get("today_credit") or data.get("daily_credit") or 0,
+            "checkin_dates": data.get("checkin_dates") or [],
+            "activity_name": data.get("activity_name") or "",
+            "message": payload.get("msg", ""),
+        }
+
+    def checkin_claim(self) -> dict[str, Any] | None:
+        state = get_state()
+        state.ensure_auth()
+        payload = state.client.api_post("/v2/billing/meter/daily-checkin")
+        if payload.get("code") not in (0, None):
+            raise RuntimeError(payload.get("msg") or f"code={payload.get('code')}")
+        data = payload.get("data") or {}
+        return {
+            "checked_in": True,
+            "extra_credits": data.get("credit") or data.get("today_credit") or data.get("daily_credit"),
+            "streak_days": data.get("streak_days") or 0,
+            "message": payload.get("msg", ""),
+        }
+
+    def quota(self) -> dict[str, Any] | None:
+        """查询积分资源包汇总（get-user-resource-summary）：每个包给周期额度，
+        单位 credits；返回「剩余合计 + 各包明细」。
+
+        ⚠️ 资源汇总走无前缀路径（/v2 下反而 404），与签到接口的前缀规则相反。
+        """
+        state = get_state()
+        state.ensure_auth()
+        payload = state.client.api_post("/billing/meter/get-user-resource-summary")
+        if payload.get("code") not in (0, None):
+            raise RuntimeError(payload.get("msg") or f"code={payload.get('code')}")
+        data = payload.get("data") or {}
+        sub_code = data.get("SubscriptionPackageCode") or ""
+
+        def to_float(v) -> float | None:
+            try:
+                return round(float(v), 2) if v not in (None, "") else None
+            except (TypeError, ValueError):
+                return None
+
+        packs = []
+        used_sum = total_sum = remain_sum = 0.0
+        for p in data.get("Packages") or []:
+            used, total, remain = (to_float(p.get("CycleUsedCapacity")),
+                                   to_float(p.get("CycleTotalCapacity")),
+                                   to_float(p.get("CycleRemainCapacity")))
+            if total is None:
+                continue
+            if used is None:
+                used = 0.0
+            if remain is None:
+                remain = round(total - used, 2)
+            used_sum += used; total_sum += total; remain_sum += remain
+            packs.append({
+                "label": "订阅套餐" if p.get("PackageCode") == sub_code else "资源包",
+                "used": used, "total": total, "remaining": remain,
+                "percent": round(used / total * 100) if total else 0,
+                "reset_ts": None,
+            })
+            if len(packs) >= 4:
+                break
+        items = [{
+            "label": "积分余额合计",
+            "used": round(used_sum, 2), "total": round(total_sum, 2),
+            "remaining": round(remain_sum, 2),
+            "percent": round(used_sum / total_sum * 100) if total_sum else 0,
+            "reset_ts": None,
+        }]
+        items.extend(packs)
+        return {"items": items, "level": "pro" if data.get("IsPaidUser") else "free"}
 
     async def forward(
         self,
@@ -172,6 +265,93 @@ class CodeBuddyProvider(BaseProvider):
             return JSONResponse(content=convert_nonstream(collected, protocol, original))
 
 
+def _elapsed_ms(started: float) -> int:
+    return round((time.time() - started) * 1000)
+
+
+def _exc_text(detail: Any) -> str:
+    """HTTPException.detail → 短文本（dict 形式的结构化错误取 message）。"""
+    if isinstance(detail, dict):
+        detail = (detail.get("error") or {}).get("message") or detail
+    return str(detail)[:300]
+
+
+async def _instrument(
+    state: Any,
+    coro,
+    *,
+    provider_id: str,
+    model_id: str,
+    protocol: str,
+    stream: bool,
+):
+    """统一指标埋点：包装 provider.forward 的结果/异常写入 MetricsCollector。
+
+    - 非流式：响应返回时立即记一条（顺带从 JSON body 提取 usage token 数）；
+    - 流式：包装 body_iterator，流结束（或中途断开）时补记，附 chunk 数。
+    metrics 未初始化（如离线冒烟测试）时直通，不改变任何转发行为。
+    """
+    metrics = getattr(state, "metrics", None)
+    if metrics is None:
+        return await coro
+    started = time.time()
+    try:
+        resp = await coro
+    except HTTPException as exc:
+        metrics.record(provider=provider_id, model=model_id, protocol=protocol,
+                       status=exc.status_code, duration_ms=_elapsed_ms(started),
+                       error=_exc_text(exc.detail))
+        raise
+    except Exception as exc:
+        metrics.record(provider=provider_id, model=model_id, protocol=protocol,
+                       status=500, duration_ms=_elapsed_ms(started), error=str(exc))
+        raise
+
+    if isinstance(resp, StreamingResponse):
+        resp.body_iterator = _metrics_stream(
+            resp.body_iterator, metrics,
+            provider_id=provider_id, model_id=model_id, protocol=protocol,
+            started=started,
+        )
+        return resp
+
+    usage: dict[str, Any] = {}
+    error = ""
+    try:
+        payload = json.loads(resp.body)
+        usage = payload.get("usage") or {}
+        if resp.status_code >= 400:
+            error = str((payload.get("error") or {}).get("message") or f"HTTP {resp.status_code}")
+    except Exception:
+        pass
+    metrics.record(
+        provider=provider_id, model=model_id, protocol=protocol,
+        status=resp.status_code, duration_ms=_elapsed_ms(started),
+        prompt_tokens=usage.get("prompt_tokens") or 0,
+        completion_tokens=usage.get("completion_tokens") or 0,
+        error=error,
+    )
+    return resp
+
+
+async def _metrics_stream(inner, metrics, *, provider_id: str, model_id: str,
+                          protocol: str, started: float):
+    """流式响应的计数包装：透传所有 chunk，结束时（含异常/断开）补记一条。"""
+    chunk_count = 0
+    error = ""
+    try:
+        async for chunk in inner:
+            chunk_count += 1
+            yield chunk
+    except Exception as exc:
+        error = f"stream error: {exc}"
+        raise
+    finally:
+        metrics.record(provider=provider_id, model=model_id, protocol=protocol,
+                       status=500 if error else 200, duration_ms=_elapsed_ms(started),
+                       stream=True, chunk_count=chunk_count, error=error)
+
+
 async def forward_chat(
     body: dict[str, Any],
     protocol: str,
@@ -188,11 +368,22 @@ async def forward_chat(
        （如豆包/Trae 模型），走该 provider 的 forward。
     3. 兜底通道：都未命中时，走 ``state.default_provider``（默认 codebuddy，
        可通过 --default-provider / PROXY_DEFAULT_PROVIDER 改为 trae 等）。
+
+    请求未带 ``model`` 字段时，用管理页设置的默认启用模型
+    （``state.default_model``，settings.py 持久化）补齐后再路由。
+    所有路径统一经 :func:`_instrument` 记录请求指标（/ui 图表数据源）。
     """
     state = get_state()
 
-    # ---- 多 provider 路由 ----
+    # ---- 默认模型：客户端未指定 model 时补齐 ----
     requested_model = body.get("model")
+    if not requested_model:
+        default_model = getattr(state, "default_model", None)
+        if default_model:
+            body = {**body, "model": default_model}
+            requested_model = default_model
+
+    # ---- 多 provider 路由 ----
     providers = getattr(state, "providers", {}) or {}
     provider = None
 
@@ -209,7 +400,11 @@ async def forward_chat(
             body = {**body, "model": real_model}
             diagnostic("provider_route", provider="codebuddy", model=real_model,
                        protocol=protocol, via="prefix")
-            return await _default_codebuddy.forward(body, protocol, original)
+            return await _instrument(
+                state, _default_codebuddy.forward(body, protocol, original),
+                provider_id="codebuddy", model_id=real_model, protocol=protocol,
+                stream=bool(body.get("stream")),
+            )
 
     # 2) 自动匹配模型 id
     if provider is None:
@@ -223,11 +418,12 @@ async def forward_chat(
         # Trae 已支持 anthropic 协议（/v1/messages 客户端如 Claude Code 可直连）；
         # 豆包等仅 openai 协议透传（doubao2api 只支持 OpenAI chat completions）。
         diagnostic("provider_route", provider=provider.id, model=requested_model, protocol=protocol)
-        try:
-            provider.ensure_auth()
-        except HTTPException:
-            raise
-        return await provider.forward(body, protocol, original)
+        provider.ensure_auth()
+        return await _instrument(
+            state, provider.forward(body, protocol, original),
+            provider_id=provider.id, model_id=requested_model, protocol=protocol,
+            stream=bool(body.get("stream")),
+        )
 
     # 3) 兜底通道：未命中任何 provider 模型列表时，按配置的默认通道转发
     default_provider_id = getattr(state, "default_provider", "codebuddy")
@@ -235,14 +431,19 @@ async def forward_chat(
         default_provider = providers[default_provider_id]
         diagnostic("provider_route", provider=default_provider.id,
                    model=requested_model, protocol=protocol, via="default")
-        try:
-            default_provider.ensure_auth()
-        except HTTPException:
-            raise
-        return await default_provider.forward(body, protocol, original)
+        default_provider.ensure_auth()
+        return await _instrument(
+            state, default_provider.forward(body, protocol, original),
+            provider_id=default_provider_id, model_id=requested_model, protocol=protocol,
+            stream=bool(body.get("stream")),
+        )
 
     # 默认 CodeBuddy 路径（对称封装，与其它 provider 一致）
-    return await _default_codebuddy.forward(body, protocol, original)
+    return await _instrument(
+        state, _default_codebuddy.forward(body, protocol, original),
+        provider_id="codebuddy", model_id=requested_model, protocol=protocol,
+        stream=bool(body.get("stream")),
+    )
 
 
 # 默认 CodeBuddy provider 单例（供 forward_chat 默认路径调用）。

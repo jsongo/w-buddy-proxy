@@ -36,7 +36,7 @@ def _login_codebuddy(open_browser: bool = True) -> int:
     """CodeBuddy（copilot.tencent.com）浏览器 OAuth 登录。"""
     import json
 
-    from buddy_proxy.codebuddy_client_demo import CodeBuddyClient, CodeBuddyError
+    from buddy_proxy.codebuddy_client import CodeBuddyClient, CodeBuddyError
 
     endpoint = os.getenv("CODEBUDDY_ENDPOINT", "https://copilot.tencent.com")
     client = CodeBuddyClient(endpoint)

@@ -64,3 +64,26 @@ class BaseProvider(abc.ABC):
     def health(self) -> dict[str, Any]:
         """返回 provider 健康状态（合并进 /health）。"""
         return {"id": self.id, "name": self.name}
+
+    # ------------------------------------------------------------------
+    # 可选能力：打卡 / 额度（/ui 管理页消费；不支持时返回 None）
+    # 全部为同步方法（上游是 urllib/httpx 同步调用），调用方用
+    # asyncio.to_thread 包装，避免阻塞事件循环。
+    # ------------------------------------------------------------------
+
+    def checkin_status(self) -> dict[str, Any] | None:
+        """查询今日签到状态。返回 ``{"checked_in": bool, "claimable": bool,
+        "inactive": bool, "streak_days": int, "message": str}``（claimable/
+        inactive 缺省视为 True/False）；不支持签到时返回 None。"""
+        return None
+
+    def checkin_claim(self) -> dict[str, Any] | None:
+        """领取今日签到积分。返回格式同 checkin_status；
+        失败时抛异常（由调用方转成错误信息）；不支持时返回 None。"""
+        return None
+
+    def quota(self) -> dict[str, Any] | None:
+        """查询套餐额度。返回 ``{"items": [{label, used, total, remaining,
+        percent, reset_ts}], "level": str|None}``（remaining/percent 无法
+        计算时为 None）；不支持时返回 None。"""
+        return None

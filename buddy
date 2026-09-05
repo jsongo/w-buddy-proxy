@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+# buddy - buddy-proxy 用户入口命令
+#
+# 日常使用：
+#   buddy start              启动代理（未运行时）并打开管理页 http://127.0.0.1:8787/ui
+#   buddy stop               停止
+#   buddy restart            重启
+#   buddy status             查看状态
+#   buddy logs               跟踪日志
+#   buddy login [provider]   登录上游账号（codebuddy(=workbuddy)/trae/zcode/doubao）
+#   buddy ui                 仅打开管理页（必要时先启动）
+#
+# 服务化（macOS launchd，登录自启 + 崩溃自动拉起）：
+#   buddy service install    注册系统服务
+#   buddy service uninstall  移除服务
+#   buddy service status     查看服务状态
+#
+# 一次性安装（把 buddy 放进 PATH，之后任意目录敲 buddy 即可）：
+#   buddy install
+#
+# 环境变量（对 start / service install 生效）：
+#   PROXY_HOST（默认 0.0.0.0）、PROXY_PORT（默认 8787）、PROXY_EXTRA_ARGS（附加启动参数）
+
+set -euo pipefail
+
+# 仓库根目录：开发态 = 脚本所在目录；通过 `buddy install` 安装后由 wrapper 注入
+BUDDY_HOME="${BUDDY_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+PROXY_SH="$BUDDY_HOME/proxy.sh"
+
+PROXY_HOST="${PROXY_HOST:-0.0.0.0}"
+PROXY_PORT="${PROXY_PORT:-8787}"
+# 与 proxy.sh 默认参数保持一致
+EXTRA_ARGS="${PROXY_EXTRA_ARGS:---desensitize --trae --doubao --zcode --default-provider trae}"
+
+SERVICE_LABEL="com.buddy.proxy"
+PLIST="$HOME/Library/LaunchAgents/${SERVICE_LABEL}.plist"
+UI_URL="http://127.0.0.1:${PROXY_PORT}/ui"
+
+log() { printf '[buddy] %s\n' "$*"; }
+
+python_bin() {
+    if [[ -x "$BUDDY_HOME/.venv/bin/python" ]]; then
+        echo "$BUDDY_HOME/.venv/bin/python"
+    else
+        command -v python3
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# launchd 服务
+# ---------------------------------------------------------------------------
+
+svc_loaded() {
+    launchctl print "gui/$UID/$SERVICE_LABEL" >/dev/null 2>&1
+}
+
+svc_start() {
+    if svc_loaded; then
+        launchctl kickstart -k "gui/$UID/$SERVICE_LABEL"
+    else
+        [[ -f "$PLIST" ]] || { log "服务未安装，先执行 buddy service install"; exit 1; }
+        launchctl bootstrap "gui/$UID" "$PLIST"
+    fi
+}
+
+svc_stop() {
+    svc_loaded && launchctl bootout "gui/$UID/$SERVICE_LABEL" || true
+}
+
+svc_write_plist() {
+    local py
+    py="$(python_bin)"
+    mkdir -p "$(dirname "$PLIST")" "$BUDDY_HOME/logs"
+    # shellcheck disable=SC2086  # EXTRA_ARGS 有意按空格拆分
+    cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${SERVICE_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${py}</string>
+        <string>-m</string>
+        <string>buddy_proxy</string>
+        <string>--host</string>
+        <string>${PROXY_HOST}</string>
+        <string>--port</string>
+        <string>${PROXY_PORT}</string>
+        <string>--log-file</string>
+        <string>${BUDDY_HOME}/logs/buddy-proxy.jsonl</string>
+$(for a in $EXTRA_ARGS; do printf '        <string>%s</string>\n' "$a"; done)
+    </array>
+    <key>WorkingDirectory</key>
+    <string>${BUDDY_HOME}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>${BUDDY_HOME}/src</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${BUDDY_HOME}/logs/service.log</string>
+    <key>StandardErrorPath</key>
+    <string>${BUDDY_HOME}/logs/service.log</string>
+</dict>
+</plist>
+EOF
+}
+
+cmd_service() {
+    case "${1:-}" in
+        install)
+            # 先停掉手动实例，避免端口冲突
+            "$PROXY_SH" stop >/dev/null 2>&1 || true
+            svc_write_plist
+            svc_stop
+            launchctl bootstrap "gui/$UID" "$PLIST"
+            log "服务已安装并启动: $PLIST"
+            log "登录时自启（RunAtLoad）+ 崩溃自动拉起（KeepAlive），日志: $BUDDY_HOME/logs/service.log"
+            ;;
+        uninstall)
+            svc_stop
+            rm -f "$PLIST"
+            log "服务已移除"
+            ;;
+        status)
+            if svc_loaded; then
+                launchctl print "gui/$UID/$SERVICE_LABEL" | grep -E "state|pid" | head -4
+            else
+                log "服务未安装（plist: ${PLIST}）"
+            fi
+            ;;
+        *)
+            log "用法: buddy service install|uninstall|status"
+            exit 1
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# 启动/停止（有服务走 launchd，否则走 proxy.sh 的 pid 管理）
+# ---------------------------------------------------------------------------
+
+cmd_start() {
+    if [[ -f "$PLIST" ]]; then
+        svc_start
+    else
+        "$PROXY_SH" start
+    fi
+    wait_healthy
+    open_ui
+}
+
+cmd_stop() {
+    if [[ -f "$PLIST" ]]; then
+        svc_stop
+        log "服务已停止（重新启动: buddy start）"
+    else
+        "$PROXY_SH" stop
+    fi
+}
+
+cmd_restart() {
+    if [[ -f "$PLIST" ]]; then
+        svc_stop
+        sleep 1
+        svc_start
+        wait_healthy
+        open_ui
+    else
+        "$PROXY_SH" restart
+        wait_healthy || true
+        open_ui
+    fi
+}
+
+cmd_status() {
+    if [[ -f "$PLIST" ]]; then
+        cmd_service status
+    fi
+    "$PROXY_SH" status || true
+    if curl -sf -o /dev/null "http://127.0.0.1:${PROXY_PORT}/health"; then
+        log "health: OK  管理页: $UI_URL"
+    else
+        log "health: 无响应"
+    fi
+}
+
+wait_healthy() {
+    for _ in $(seq 1 20); do
+        if curl -sf -o /dev/null "http://127.0.0.1:${PROXY_PORT}/health"; then
+            return 0
+        fi
+        sleep 0.5
+    done
+    log "警告: /health 20s 内未就绪（查看日志: buddy logs）"
+    return 1
+}
+
+open_ui() {
+    if command -v open >/dev/null 2>&1; then
+        open "$UI_URL"
+    elif command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$UI_URL" 2>/dev/null || true
+    else
+        log "$UI_URL"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 自安装到 PATH
+# ---------------------------------------------------------------------------
+
+cmd_install() {
+    local target_dir target
+    if [[ -w /usr/local/bin ]]; then
+        target_dir="/usr/local/bin"
+    else
+        target_dir="$HOME/.local/bin"
+        mkdir -p "$target_dir"
+    fi
+    target="$target_dir/buddy"
+    cat > "$target" <<EOF
+#!/bin/sh
+# generated by 'buddy install' — repo: $BUDDY_HOME
+BUDDY_HOME="$BUDDY_HOME"
+export BUDDY_HOME
+exec "$BUDDY_HOME/buddy" "\$@"
+EOF
+    chmod +x "$target" "$BUDDY_HOME/buddy"
+    log "已安装: $target -> $BUDDY_HOME/buddy"
+    case ":$PATH:" in
+        *":$target_dir:"*) ;;
+        *)
+            log "注意: $target_dir 不在 PATH 里，请把下面这行加进 ~/.zshrc："
+            log "  export PATH=\"$target_dir:\$PATH\""
+            ;;
+    esac
+    log "之后即可在任意目录使用: buddy start"
+}
+
+case "${1:-}" in
+    start)        cmd_start ;;
+    stop)         cmd_stop ;;
+    restart)      cmd_restart ;;
+    status)       cmd_status ;;
+    logs)         exec "$PROXY_SH" logs ;;
+    login)        shift; exec "$PROXY_SH" login "$@" ;;
+    ui)
+        if ! curl -sf -o /dev/null "http://127.0.0.1:${PROXY_PORT}/health"; then
+            "$PROXY_SH" start || true
+        fi
+        wait_healthy || true
+        open_ui ;;
+    service)      shift; cmd_service "$@" ;;
+    install)      cmd_install ;;
+    -h|--help|help|"")
+        sed -n '/^# buddy - /,/^#   PROXY_HOST/p' "$0" | sed 's/^# \{0,1\}//'
+        ;;
+    *)
+        log "未知命令: $1（buddy help 查看用法）"
+        exit 1
+        ;;
+esac

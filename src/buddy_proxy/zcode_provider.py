@@ -21,10 +21,6 @@ bigmodel-coding-plan 通道同款）：
 3. 本机 ZCode CLI 配置 ``~/.zcode/v2/config.json`` 中已启用的
    ``builtin:bigmodel-coding-plan`` / ``builtin:zai`` 等 provider 的 apiKey
    （格式 ``<apiKey>.<secretKey>``，即智谱官网 coding-plan API Key）
-4. ZCode OAuth 铸 key 流程（参考 CLIProxyAPI PR #3928）：本地起 loopback
-   callback server → 打开 bigmodel.cn 登录 → authCode 换 OAuth token →
-   biz API 铸 ``<apiKey>.<secretKey>``。仅在前三者都没有时才需要，
-   通过 ``python -m buddy_proxy.zcode_login`` 手动触发。
 
 安全：API key 只在服务端使用，绝不明文进日志；secrets 文件 chmod 600。
 """
@@ -34,6 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 import urllib.parse
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterator, Sequence
@@ -85,6 +82,43 @@ MODEL_NAME_CANONICAL: dict[str, str] = {
 }
 
 _TIMEOUT = httpx.Timeout(connect=15.0, read=600.0, write=60.0, pool=15.0)
+
+
+def _window_label(reset_ts: float | None, ltype: str | None) -> str:
+    """按重置时间推断限额窗口的展示名（5 小时 / 每周 / 更长周期）。"""
+    if ltype == "TIME_LIMIT":
+        return "MCP 调用（月）"
+    if reset_ts:
+        delta = reset_ts - time.time()
+        if delta < 86400 * 2:
+            return "5 小时窗口"
+        if delta < 86400 * 10:
+            return "每周窗口"
+        return f"周期窗口（{time.strftime('%m-%d', time.localtime(reset_ts))} 重置）"
+    return ltype or "用量窗口"
+
+
+def _quota_items(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """把 /api/monitor/usage/quota/limit 的 limits 归一化为管理页额度条目。
+
+    按 nextResetTime 升序：最近的窗口排前面（实测 5 小时窗口在前、每周在后）。
+    CREDIT_LIMIT：usage=窗口总额度，currentValue=已用；TIME_LIMIT 单位为次数。
+    """
+    limits = [l for l in (data.get("limits") or []) if isinstance(l, dict)]
+    limits.sort(key=lambda l: l.get("nextResetTime") or 0)
+    items: list[dict[str, Any]] = []
+    for l in limits:
+        reset_ms = l.get("nextResetTime")
+        reset_ts = reset_ms / 1000 if reset_ms else None
+        items.append({
+            "label": _window_label(reset_ts, l.get("type")),
+            "used": l.get("currentValue"),
+            "total": l.get("usage"),
+            "remaining": l.get("remaining"),
+            "percent": l.get("percentage"),
+            "reset_ts": reset_ts,
+        })
+    return items
 
 
 # ---------------------------------------------------------------------------
@@ -233,8 +267,8 @@ class ZcodeProvider(BaseProvider):
                         "message": (
                             "zcode 未配置认证：请设置 ZCODE_API_KEY / "
                             "~/.ethan/.secrets/zcode_api_key，或在本机 ZCode CLI "
-                            "登录 coding-plan；也可运行 "
-                            "`python -m buddy_proxy.zcode_login` 走 OAuth 铸 key"
+                            "登录 coding-plan（凭据存于 ~/.zcode/v2/config.json，"
+                            "本 provider 会自动读取）"
                         ),
                         "type": "authentication_error",
                     }
@@ -328,6 +362,29 @@ class ZcodeProvider(BaseProvider):
             "base_url": self._base,
             "models": list(DEFAULT_MODELS),
         }
+
+    # ---- 额度查询（/ui 管理页消费；同步 httpx，调用方经 asyncio.to_thread 包装） ----
+
+    def quota(self) -> dict[str, Any] | None:
+        """查询 GLM Coding Plan 用量窗口（5 小时 / 每周等 CREDIT/TIME 限额）。
+
+        端点由 anthropic base 推导同源 host（open.bigmodel.cn / api.z.ai），
+        认证复用 coding-plan API key（Authorization 原样携带，无 Bearer 前缀）。
+        """
+        key = self._api_key or resolve_credentials()[0]
+        if not key:
+            raise RuntimeError("zcode 未配置 API key，无法查询额度")
+        origin = self._base.split("/api/")[0]
+        url = f"{origin}/api/monitor/usage/quota/limit"
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.get(url, headers={"Authorization": key, "Content-Type": "application/json"})
+        if resp.status_code != 200:
+            raise RuntimeError(f"quota HTTP {resp.status_code}: {resp.text[:200]}")
+        payload = resp.json()
+        if not payload.get("success"):
+            raise RuntimeError(payload.get("msg") or "quota query failed")
+        data = payload.get("data") or {}
+        return {"items": _quota_items(data), "level": data.get("level")}
 
 
 # ---------------------------------------------------------------------------

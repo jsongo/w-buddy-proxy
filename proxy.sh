@@ -7,6 +7,7 @@
 #   ./proxy.sh restart  [-p PORT] [-H HOST]     # 重启
 #   ./proxy.sh status                            # 查看状态
 #   ./proxy.sh logs                              # 跟踪日志
+#   ./proxy.sh ui                                # 确保在跑并打开管理页 http://127.0.0.1:8787/ui
 #   ./proxy.sh login    [provider] [--no-browser] # 登录上游账号（默认 codebuddy；
 #                                                # provider: codebuddy(=workbuddy)/trae/zcode/doubao）
 #                                                # 登录成功后若网关在运行，需 restart 生效
@@ -96,7 +97,6 @@ cmd_start() {
         --host "$PROXY_HOST" \
         --port "$PROXY_PORT" \
         --log-file "$LOG_DIR/buddy-proxy.jsonl" \
-        --static-models \
         $EXTRA_ARGS \
         >>"$LOG_FILE" 2>&1 &
     local new_pid=$!
@@ -170,6 +170,26 @@ cmd_logs() {
     tail -n 100 -F "$LOG_FILE"
 }
 
+cmd_ui() {
+    # 确保在跑（未跑则先启动），然后用浏览器打开管理页
+    local pid
+    pid="$(read_pid)"
+    if ! is_running "$pid"; then
+        cmd_start || return 1
+    fi
+    local actual
+    actual=$(ps -o command= -p "$(read_pid)" 2>/dev/null | grep -oE -- '--port[[:space:]]+[0-9]+' | awk '{print $2}' | head -1)
+    local url="http://127.0.0.1:${actual:-$PROXY_PORT}/ui"
+    log "opening $url"
+    if command -v open >/dev/null 2>&1; then
+        open "$url"
+    elif command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$url"
+    else
+        echo "$url"
+    fi
+}
+
 cmd_login() {
     local provider="codebuddy"
     local extra=()
@@ -206,6 +226,7 @@ case "${1:-}" in
     status)  cmd_status ;;
     logs)    cmd_logs ;;
     login)   shift; cmd_login "$@" ;;
+    ui)      cmd_ui ;;
     -h|--help|help|"") usage ;;
     *)       usage ;;
 esac
