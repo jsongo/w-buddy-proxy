@@ -1209,6 +1209,7 @@ class _StreamToolCallSplitter:
     def __init__(self, known_tools: frozenset[str] | None = None) -> None:
         self._buf = ""
         self._tools = frozenset(known_tools) if known_tools else None
+        self._bare_hold = None
 
     @staticmethod
     def _first_tag_pos(buf: str) -> int:
@@ -1280,7 +1281,9 @@ class _StreamToolCallSplitter:
         if not self._tools:
             return -1
         for m in re.finditer(r"(?m)^[ \t]*\"?name\b", buf):
-            if _loose_kv_plausible(buf[m.start():], self._tools):
+            # 限窗切片：plausible 只消费形态前缀，无需 buf 全尾（无界切片
+            # 在多 name 行的大 payload 下是二次方放大，实测 69KB/2000 行 870ms）
+            if _loose_kv_plausible(buf[m.start():m.start() + 2048], self._tools):
                 return m.start()
         # 尾部行可能是发展中的 name 前缀（跨 chunk 分裂，如 buf 以 'na' 结尾）
         last_nl = buf.rfind("\n")
@@ -1299,13 +1302,18 @@ class _StreamToolCallSplitter:
         """
         if not self._tools:
             return -1
-        tools_alt = "|".join(
-            sorted((re.escape(t) for t in self._tools), key=len, reverse=True))
-        m = re.search(
-            r'\{\s*"?name"?\s*:[ \t]*"(?:' + tools_alt + r')"[^\n]{0,200}?"arguments"'
-            r'|name\s*:\s*"(?:' + tools_alt + r')"[ \t\r\n]*,?[ \t\r\n]*arguments\s*:'
-            r'|\b(?:' + tools_alt + r')[ \t]*\([ \t]{0,40}[A-Za-z_]\w*[ \t]*=',
-            buf)
+        if not hasattr(self, "_inline_re"):
+            # tools_alt 与 _tail_hold_pos 共用惰性缓存（避免每 chunk 重拼正则串）
+            tools_alt = getattr(self, "_tools_alt", None)
+            if not tools_alt:
+                tools_alt = "|".join(
+                    sorted((re.escape(t) for t in self._tools), key=len, reverse=True))
+                self._tools_alt = tools_alt
+            self._inline_re = re.compile(
+                r'\{\s*"?name"?\s*:[ \t]*"(?:' + tools_alt + r')"[^\n]{0,200}?"arguments"'
+                r'|name\s*:\s*"(?:' + tools_alt + r')"[ \t\r\n]*,?[ \t\r\n]*arguments\s*:'
+                r'|\b(?:' + tools_alt + r')[ \t]*\([ \t]{0,40}[A-Za-z_]\w*[ \t]*=')
+        m = self._inline_re.search(buf)
         return m.start() if m else -1
 
     def _call_expr_pos(self, buf: str) -> int:
@@ -1364,6 +1372,11 @@ class _StreamToolCallSplitter:
                         break
         return best
 
+    # 「发展中前缀」三正则天然只关心尾部（合法匹配最长 ~250 字符），限定
+    # 窗口防止每 chunk 对全量 buffer 回溯——实测不限定时二次方放大
+    # （500KB 扣留 payload 流式路径 105s CPU，200KB 15.7s）。
+    _TAIL_WINDOW = 512
+
     def _tail_hold_pos(self, buf: str) -> int:
         """尾部发展中候选的扣留位置（行内调用证据天然跨 chunk）。
 
@@ -1393,26 +1406,108 @@ class _StreamToolCallSplitter:
                 # 已知工具名 + ( 参数发展
                 re.compile(r'\b(?:' + tools_alt + r')\s*\(\s*[^)\n]{0,200}$'),
             )
+            self._bare_anchor_re = re.compile(
+                r'\{\s*"?name"?\s*:\s*"?(?:' + tools_alt + r')')
         best = -1
+        # 尾部正则只在窗口内搜（$ 锚定，窗口外命中不可能也不需要）
+        offset = max(0, len(buf) - self._TAIL_WINDOW)
+        tail = buf[offset:]
         for pat in self._tail_res:
-            m = pat.search(buf)
-            if m and (best == -1 or m.start() < best):
-                best = m.start()
+            m = pat.search(tail)
+            if m:
+                p = offset + m.start()
+                if best == -1 or p < best:
+                    best = p
         # 裸 JSON 参数区深度扣留（不限长，大 payload 的 content 可达数百 KB）：
-        # {"name": "已知工具" 前缀一旦出现，扣住直到参数区闭合或流结束
-        m = re.search(r'\{\s*"?name"?\s*:\s*"?(?:' + self._tools_alt + r')', buf)
-        if m:
-            b = buf.find("{", m.end())
-            if b == -1 or _find_obj_extent(buf, b) == -1:
-                if best == -1 or m.start() < best:
-                    best = m.start()
+        # {"name": "已知工具" 前缀一旦出现，扣住直到参数区闭合或流结束。
+        # 增量扫描版：锚点只搜一次，之后每 chunk 只扫新增尾部
+        bp = self._bare_hold_pos(buf)
+        if bp != -1 and (best == -1 or bp < best):
+            best = bp
         # 工具名前缀尾部（含单字符、完整名）：tool( 表达式跨 chunk 发展；
         # 完整名后跟非 ( 时下一步即发散，误扣窗口一两个 chunk
-        m2 = re.search(r'[A-Za-z_][\w.]{0,31}$', buf)
+        m2 = re.search(r'[A-Za-z_][\w.]{0,31}$', tail)
         if m2 and any(t.startswith(m2.group(0)) for t in self._tools):
-            if best == -1 or m2.start() < best:
-                best = m2.start()
+            p = offset + m2.start()
+            if best == -1 or p < best:
+                best = p
         return best
+
+    def _bare_hold_pos(self, buf: str) -> int:
+        """裸 JSON 扣留的增量扫描实现（替代每 chunk 全量 anchor+extent）。
+
+        状态（_bare_hold）以 buf 绝对坐标保存：扣留期间 feed 只会从 pos≤at
+        处切片（at 是本检测器的扣留点，feed 取各检测器最小值），锚点之前
+        不会被放出，因此坐标只需在 feed 切片时整体平移（_shift_bare_hold）。
+        闭合释放后进入 closed 态：锚点只在新增尾部（scan 之后）重搜，避免
+        对已闭合区域反复全量扫描。
+        """
+        st = self._bare_hold
+        if st is not None and st.get("closed"):
+            m = self._bare_anchor_re.search(buf, st["scan"])
+            if not m:
+                st["scan"] = len(buf)
+                return -1
+            st = self._bare_hold = {
+                "at": m.start(), "b": -1, "scan": m.end(),
+                "depth": 0, "instr": False, "closed": False,
+            }
+        elif st is None:
+            m = self._bare_anchor_re.search(buf)
+            if not m:
+                return -1
+            st = self._bare_hold = {
+                "at": m.start(), "b": -1, "scan": m.end(),
+                "depth": 0, "instr": False, "closed": False,
+            }
+        at = st["at"]
+        i, n = st["scan"], len(buf)
+        depth, instr, b = st["depth"], st["instr"], st["b"]
+        while i < n:
+            ch = buf[i]
+            if b == -1:
+                # arguments 对象的 '{' 还没出现
+                if ch == "{":
+                    b, depth = i, 1
+                i += 1
+                continue
+            if instr:
+                if ch == "\\":
+                    if i + 1 >= n:
+                        # 反斜杠是本 buffer 最后一字符：转义对跨 chunk 分裂，
+                        # scan 原地停在反斜杠处，下 chunk 重读后再跳过整对
+                        break
+                    i += 2
+                    continue
+                if ch == '"':
+                    instr = False
+            elif ch == '"':
+                instr = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth <= 0:
+                    # 对象闭合：释放扣留（闭合的完整对象交给正常解析路径）
+                    st.update(scan=i + 1, depth=depth, instr=instr, b=b, closed=True)
+                    return -1
+            i += 1
+        st.update(scan=i, depth=depth, instr=instr, b=b)
+        return at
+
+    def _shift_bare_hold(self, pos: int, reset: bool) -> None:
+        """feed() 切片后平移裸扣留状态的 buf 坐标；buffer 重置时清状态。"""
+        if reset or pos <= 0 or not self._bare_hold:
+            if reset:
+                self._bare_hold = None
+            return
+        st = self._bare_hold
+        st["at"] -= pos
+        st["scan"] -= pos
+        if st["b"] != -1:
+            st["b"] -= pos
+        if st["at"] < 0:  # 防御：正常不会发生（pos ≤ at）
+            self._bare_hold = None
 
     def feed(self, text: str) -> str:
         self._buf += text
@@ -1438,13 +1533,16 @@ class _StreamToolCallSplitter:
                 pos = ip
         if pos == -1:
             safe, self._buf = self._buf, ""
+            self._shift_bare_hold(0, reset=True)
         else:
             safe, self._buf = self._buf[:pos], self._buf[pos:]
+            self._shift_bare_hold(pos, reset=False)
         return safe
 
     def flush(self) -> tuple[str, list[dict[str, Any]]]:
         rest, calls = _parse_tool_calls(self._buf, self._tools)
         self._buf = ""
+        self._bare_hold = None
         return rest, calls
 
 
@@ -1511,6 +1609,9 @@ _GATE_NAME_RES = (
     re.compile(r'[ \t]*name"?[ \t]*:[ \t]*"?([A-Za-z_][\w.-]*)'),
 )
 
+# word_tool 兜底的搜索窗口：工具名作为「调用开头」证据，只在段首找
+_GATE_WORD_WINDOW = 120
+
 
 def _gate_tool_name(seg: str) -> str:
     """闸门证据提取：从调用开头段里取出工具名（JSON 键 / 散装 name:）。"""
@@ -1522,9 +1623,15 @@ def _gate_tool_name(seg: str) -> str:
 
 
 def _gate_word_tool(seg: str, known: frozenset[str]) -> str:
-    """证据兜底：段里出现独立成词的已知工具名（键语法损坏时）。"""
+    """证据兜底：段里出现独立成词的已知工具名（键语法损坏时）。
+
+    只在段首 _GATE_WORD_WINDOW 内找：工具名属于「调用开头」的证据，
+    离 `{`/锚点太远的命中（比如参数值或后文提到别的工具名）不足以
+    把整段判成调用——误伤正文会静默发伪 tool_call，比泄漏更糟。
+    """
+    head = seg[:_GATE_WORD_WINDOW]
     for t in known:
-        if re.search(r"(?<![A-Za-z0-9_])" + re.escape(t) + r"(?![A-Za-z0-9_])", seg):
+        if re.search(r"(?<![A-Za-z0-9_])" + re.escape(t) + r"(?![A-Za-z0-9_])", head):
             return t
     return ""
 
@@ -2095,6 +2202,11 @@ def _parse_tool_calls(
                             ag = _flatten_call_args(obj) if obj.get("name") or obj.get("tool") else obj
                             calls.append(_mk_tool_call(
                                 len(calls), call_nm, json.dumps(ag, ensure_ascii=False)))
+                            # 打捞与丢弃同样入日志：误收伪调用比泄漏更难排查，
+                            # [toolcall-gate] 一个 grep 应看到闸门的全部动作
+                            log.warning(
+                                "[toolcall-gate] 补收调用残段 tool=%s len=%d 片段=%r",
+                                call_nm, end - p, rest[p:p + 80])
                         gate_out.append(rest[gpos:p])
                         gpos = end
                         touched = True

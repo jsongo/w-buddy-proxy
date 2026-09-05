@@ -27,7 +27,10 @@ OUT = Path(__file__).resolve().parent / "fixtures" / "badcases"
 # 泄漏签名：正文含调用语法特征（tool_calls 为空 = 没走正常调用通道）
 SIGS = {
     "bare_json": re.compile(r'\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"'),
-    "loose_kv": re.compile(r'name\s*:\s*"[A-Za-z_][\w.-]*"\s*,?\s*arguments\s*:'),
+    # 散装 kv：值与 arguments 限同行/紧邻下一行（\s* 跨行无界会把
+    # 「name: "x" 出现在 JS 对象、arguments: 在几百行之外」的正文误报）
+    "loose_kv": re.compile(
+        r'name[ \t]*:[ \t]*"[A-Za-z_][\w.-]*"[ \t]*,?[ \t]*(?:\r?\n[ \t]*)?arguments[ \t]*:'),
     "tagged": re.compile(r"<\s*/?\s*tool_call[^>]*>"),
     "attr_tag": re.compile(r'<tool_call\s+name="'),
     "seed": re.compile(r"<seed:tool_call>"),
@@ -55,11 +58,13 @@ def main() -> int:
     q = ("SELECT id, session_id, model, content, datetime(created_at,'unixepoch','localtime') "
          "FROM messages WHERE role='assistant' AND (tool_calls IS NULL OR tool_calls='') "
          "AND status='completed'")
+    params: tuple = ()
     if args.session:
-        q += f" AND session_id='{args.session}'"
+        q += " AND session_id=?"
+        params = (args.session,)
     q += " ORDER BY id DESC"
     hits = []
-    for mid, sid, model, content, ts in con.execute(q):
+    for mid, sid, model, content, ts in con.execute(q, params):
         if not content:
             continue
         found = [name for name, pat in SIGS.items() if pat.search(content)]

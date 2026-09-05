@@ -278,6 +278,18 @@ for esc, want in (
         calls[0]["function"]["arguments"])["command"] == f"echo {want} data"
     check(f"esc:{esc!r}", ok and not leak_markers(content),
           f"n={len(calls)} content={content[:60]!r}")
+    # 流式极限切点（chunk=1：每个转义对/引号都跨 chunk 分裂）下参数仍须
+    # 完整——增量扫描器的转义对在 chunk 边界断裂时不得错算引号/深度
+    for chunk in (1, 2, 5):
+        sp = _StreamToolCallSplitter(KNOWN)
+        out = []
+        for k in range(0, len(body), chunk):
+            out.append(sp.feed(body[k:k + chunk]))
+        tail, scalls = sp.flush()
+        got = json.loads(scalls[0]["function"]["arguments"])["command"] if scalls else None
+        check(f"esc:{esc!r}:s{chunk}", len(scalls) == 1 and got == f"echo {want} data"
+              and not leak_markers("".join(out) + tail),
+              f"n={len(scalls)} got={got!r}")
 
 # 5. 未转义双引号专项（deepseek 风格 echo "---"）
 for q in ('echo "---"', 'echo "{" && ls', 'grep "x" f && echo "}"'):
@@ -367,6 +379,19 @@ for body, want in (
 big = ('{"name": "file_write", "arguments": {"content": "'
        + ("x" * 200_000) + '", "path": "/tmp/big"}}')
 assert_no_leak("big_payload", big, chunk=1024)
+
+# 12b. 大 payload 流式路径耗时上限（隐性性能回归曾达二次方放大：
+# 200KB@512 曾 15.7s，增量扫描+尾窗后应 <1s；此处给 5 倍余量防 CI 抖动）
+import time as _time
+_big512 = ('{"name": "file_write", "arguments": {"content": "'
+           + ("x" * 200_000) + '", "path": "/tmp/big"}}')
+_sp = _StreamToolCallSplitter(KNOWN)
+_t0 = _time.perf_counter()
+for _k in range(0, len(_big512), 512):
+    _sp.feed(_big512[_k:_k + 512])
+_sp.flush()
+_big_dt = _time.perf_counter() - _t0
+check("big_payload:512chunk 耗时<2.5s", _big_dt < 2.5, f"took={_big_dt:.2f}s")
 
 print()
 print(f"total checks: {total}")
