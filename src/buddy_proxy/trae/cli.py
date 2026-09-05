@@ -10,7 +10,8 @@ import logging
 import sys
 
 from .benefits_api import claim_checkin_credits, fetch_checkin_status, fetch_ent_usage
-from .config import _map_model
+from .credentials import _auth, _load_work_cred
+from .sse import _parse_sse, _trae_error_text
 from .transport import send_trae_chat
 
 log = logging.getLogger(__name__)

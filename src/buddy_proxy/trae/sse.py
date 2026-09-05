@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, AsyncIterator, Iterator
+from typing import Any, Iterator
 
 from ..anthropic_adapter import AnthropicStreamConverter
 

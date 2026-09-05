@@ -18,18 +18,19 @@ from ..anthropic_adapter import chat_completion_to_anthropic_message
 from ..providers import BaseProvider
 from .benefits_api import claim_checkin_credits, fetch_checkin_status, fetch_ent_usage
 from .config import (
+    BASE_URL_CN,
     MODEL_MAP,
     MODEL_TIERS,
     TRAE_HEARTBEAT_INTERVAL,
+    _NATIVE_TOOLS_ENABLED,
     _debug_dump,
     _heartbeat_text,
-    _map_model,
 )
 from .credentials import _auth
 from .leak_guard import _StreamLeakCleaner, _sanitize_agent_leak
 from .native_tools import (
     _NativeToolAccumulator,
-    _NATIVE_TOOLS_ENABLED,
+    _native_messages,
     _native_rejected,
     _send_native_chat,
 )
@@ -160,10 +161,11 @@ class TraeProvider(BaseProvider):
         )
 
         tools = body.get("tools") or []
-        # 原生 function calling 通道：带 tools 的请求优先走结构化直通
-        # （chat_v3 + 原生 tools），上游 4001 拒绝时自动回落文本协议。
-        # prompt（文本协议转换）始终照算——它是兜底路径的输入。
-        native_mode = bool(tools) and _NATIVE_TOOLS_ENABLED
+        # 原生通道：全部请求（含纯聊天）默认走 chat_v3 直通——该通道无 agent
+        # 预设，纯聊天不再需要 guard 注入与泄漏清洗。上游 4001 拒绝时自动回落
+        # 文本协议（prompt 始终照算，它就是兜底路径的输入：纯聊天带 guard、
+        # 工具请求带教学）。
+        native_mode = _NATIVE_TOOLS_ENABLED
         prompt = _extract_prompt(
             messages, guard=not agent_mode, tools=tools if agent_mode else None
         )
@@ -222,7 +224,6 @@ class TraeProvider(BaseProvider):
         """把 Trae SSE 转成 OpenAI chat.completion.chunk 流。"""
         request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
-        in_thinking = False
         usage: dict[str, Any] | None = None
 
         def chunk(delta: dict[str, Any], finish: str | None = None) -> str:
@@ -330,7 +331,6 @@ class TraeProvider(BaseProvider):
                     return
                 if event == "output":
                     if data.get("reasoning_content"):
-                        in_thinking = True
                         yield chunk({"reasoning_content": data["reasoning_content"]})
                     if acc is not None:
                         # 原生通道：tool_calls 按结构化事件累积，正文不经
@@ -341,7 +341,6 @@ class TraeProvider(BaseProvider):
                         if text:
                             dbg_parts.append(text)
                             yield chunk({"role": "assistant", "content": text})
-                            in_thinking = False
                     elif data.get("response"):
                         text = data["response"]
                         if cleaner is not None:
@@ -351,7 +350,6 @@ class TraeProvider(BaseProvider):
                         if text:
                             dbg_parts.append(text)
                             yield chunk({"role": "assistant", "content": text})
-                            in_thinking = False
                 elif event == "token_usage":
                     u = data or {}
                     try:

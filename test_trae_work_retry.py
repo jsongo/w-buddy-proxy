@@ -45,7 +45,7 @@ def test_succeeds_on_third_attempt():
     """前两次瞬态失败、第 3 次成功 → 成功返回，恰好 3 次调用，退避 sleep 2 次。"""
     raw = b"event: output\ndata: {}\n"
     with mock.patch("urllib.request.urlopen") as up, mock.patch(
-        "buddy_proxy.trae_provider.time.sleep"
+        "buddy_proxy.trae.transport.time.sleep"  # 拆分后 _send_trae_work_chat 在 transport 模块
     ) as sleep:
         up.side_effect = [IncompleteRead(b"part", 5), TimeoutError("read timed out"), _ok_cm(raw)]
         result = _run()
@@ -57,7 +57,7 @@ def test_succeeds_on_third_attempt():
 def test_all_attempts_fail_raises_502():
     """3 次全失败（非 HTTPError）→ HTTPException(502)，detail 带次数与原始错误。"""
     with mock.patch("urllib.request.urlopen") as up, mock.patch(
-        "buddy_proxy.trae_provider.time.sleep"
+        "buddy_proxy.trae.transport.time.sleep"  # 拆分后 _send_trae_work_chat 在 transport 模块
     ):
         up.side_effect = [TimeoutError("t1"), ConnectionResetError("reset"), IncompleteRead(b"", 9)]
         with pytest.raises(HTTPException) as ei:
@@ -72,7 +72,7 @@ def test_non_http_error_is_retried():
     """非 HTTPError 异常（IncompleteRead，实测断流形态）→ 视为瞬态，重试后成功。"""
     raw = b"event: done\n"
     with mock.patch("urllib.request.urlopen") as up, mock.patch(
-        "buddy_proxy.trae_provider.time.sleep"
+        "buddy_proxy.trae.transport.time.sleep"  # 拆分后 _send_trae_work_chat 在 transport 模块
     ) as sleep:
         up.side_effect = [IncompleteRead(b"half", 100), _ok_cm(raw)]
         result = _run()
@@ -84,7 +84,7 @@ def test_non_http_error_is_retried():
 def test_http_error_4xx_not_retried():
     """上游 401（HTTPError，非瞬态）→ 不重试，直接 HTTPException(502)，只调用 1 次。"""
     with mock.patch("urllib.request.urlopen") as up, mock.patch(
-        "buddy_proxy.trae_provider.time.sleep"
+        "buddy_proxy.trae.transport.time.sleep"  # 拆分后 _send_trae_work_chat 在 transport 模块
     ) as sleep:
         up.side_effect = _http_error(401, b'{"code": 401}')
         with pytest.raises(HTTPException) as ei:

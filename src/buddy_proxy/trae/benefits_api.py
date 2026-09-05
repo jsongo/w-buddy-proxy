@@ -5,11 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
-import time
 import urllib.error
 import urllib.request
 from typing import Any
+
+from .credentials import _auth
 
 log = logging.getLogger(__name__)
 

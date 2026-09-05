@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -17,8 +18,15 @@ from typing import Any
 
 from fastapi import HTTPException
 
-from .config import BASE_URL_CN, _NATIVE_FUNCTION, _map_model
-from .credentials import _build_headers, _load_work_cred, _work_headers
+from .config import (
+    BASE_URL_CN,
+    _NATIVE_FUNCTION,
+    _WORK_CHAT_MAX_ATTEMPTS,
+    _map_model,
+)
+from .credentials import _auth, _build_headers, _load_work_cred, _work_headers
+from .sse import _parse_sse
+from .text_protocol import _content_blocks
 
 log = logging.getLogger(__name__)
 
@@ -132,7 +140,7 @@ def _build_native_body(
     tools: list[dict[str, Any]] | None,
 ) -> dict[str, Any]:
     session_id = str(uuid.uuid4())
-    return {
+    body = {
         "messages": native_msgs,
         "model": trae_model,
         "config_name": trae_model,
@@ -140,8 +148,12 @@ def _build_native_body(
         "stream": stream,
         "request_id": session_id,
         "session_id": session_id,
-        "tools": _native_tools_payload(tools),
     }
+    tools_payload = _native_tools_payload(tools)
+    if tools_payload:
+        # 纯聊天请求不带 tools 键（实测裸请求与空数组均可，省略更干净）
+        body["tools"] = tools_payload
+    return body
 
 
 def _send_native_chat(
@@ -167,16 +179,34 @@ def _send_native_chat(
         "Accept": "text/event-stream" if stream else "application/json",
     }
     url = f"{BASE_URL_CN}/api/agent/v3/llm_utils_chat"
-    req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
-                                 headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            return resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", errors="replace")[:2000]
-        if e.code == 400:
-            return detail or '{"code":4001}'
-        raise HTTPException(status_code=502, detail=f"trae native chat failed: {e.code} {detail}")
+    payload = json.dumps(body).encode("utf-8")
+    last_error: Exception | None = None
+    for attempt in range(1, _WORK_CHAT_MAX_ATTEMPTS + 1):
+        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                return resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")[:2000]
+            if e.code == 400:
+                # Go schema 拒绝的另一种壳：原样返回文本，交给 _native_rejected
+                # 判定回落（文本协议兜底是对 4001 的正确响应）
+                return detail or '{"code":4001}'
+            raise HTTPException(status_code=502, detail=f"trae native chat failed: {e.code} {detail}")
+        except Exception as e:
+            # 与 Work 通道同款：HTTPError 之外视为瞬态（IncompleteRead/断连/超时），
+            # 同端点退避重试；4xx 参数拒绝不走这里（上面已返回/抛出）
+            last_error = e
+            if attempt < _WORK_CHAT_MAX_ATTEMPTS:
+                log.warning(
+                    "Trae native chat attempt %d/%d failed (%s: %s), retrying",
+                    attempt, _WORK_CHAT_MAX_ATTEMPTS, type(e).__name__, e,
+                )
+                time.sleep(attempt)
+    raise HTTPException(
+        status_code=502,
+        detail=f"trae native chat failed after {_WORK_CHAT_MAX_ATTEMPTS} attempts: {last_error}",
+    )
 
 
 class _NativeToolAccumulator:

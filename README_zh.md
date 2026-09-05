@@ -89,6 +89,10 @@ uv run python -m buddy_proxy --desensitize --trae
   或从 `.env` 读 `TRAE_TOKEN` / `TRAE_USER_ID`，直连 `trae-api-cn.mchost.guru`
 - **模型**：T1-T5 分级（glm-5.2 / qwen-3.7-plus / kimi-k2.6 / DeepSeek-V4-Pro 等），
   支持外部名别名（如 `claude-sonnet-4-5` → `glm-5.2`）
+- **原生通道（2026-09 起）**：全部请求（含纯聊天）默认走 `chat_v3` 直通——
+  带 `tools` 时为原生 function calling（结构化 `tool_calls` + `role:"tool"` 历史回放），
+  纯聊天无服务端 agent 预设、不再注入压制指令与泄漏清洗；实测 17 个模型
+  16 个原生可用（仅 glm-5-turbo 不在通道，自动回落文本协议）；通道还带真实 token usage
 - **依赖**：纯 Python 标准库（含零依赖 AES 兜底实现），不需要 Node.js
 - **注意**：免费账号有日/周调用额度，耗尽时报 `4011`（今日用量已达上限），
   错误会以友好中文文案透传
@@ -352,20 +356,27 @@ providers:
 | 模型 | `doubao`（快速）/ `doubao-pro` / `doubao-think`（深度思考）/ `doubao-expert`（专家） |
 | 依赖 | 纯 Python 标准库，无 Playwright / chromium |
 
-### 3. Trae Provider（`trae_provider.py` + `trae_work_login*.py`）
+### 3. Trae Provider（`trae/` 子包 + `trae_work_login*.py`）
+
+实现已从单体 `trae_provider.py`（3400+ 行）拆分为 `trae/` 子包，按职责分 12 个模块：
+`config`（常量/版本头/模型映射）、`auth_storage`（IDE 存储解密）、`benefits_api`（签到/权益）、
+`credentials`（凭证与请求头）、`leak_guard`（预设泄漏防护）、`text_toolcall`（文本协议解析兜底）、
+`text_protocol`（教学注入/请求改写）、`native_tools`（原生 function calling）、`transport`（HTTP 发送）、
+`sse`（SSE 解析/Anthropic 包装）、`provider`（编排入口）、`cli`（账号工具）。
+`trae_provider.py` 保留为兼容 shim，历史导入与 `python -m buddy_proxy.trae_provider` 不受影响。
 
 | 类别 | 接口 | 说明 |
 | --- | --- | --- |
-| 认证 | `decrypt_auth_data()` / `find_auth_data()` | 解密 Trae IDE 本地 `storage.json`（AES-128-CBC + SHA-512 派生） |
+| 认证 | `auth_storage.decrypt_auth_data()` / `find_auth_data()` | 解密 Trae IDE 本地 `storage.json`（AES-128-CBC + SHA-512 派生） |
 | 认证 | `trae_work_login.py` / `trae_work_login_server.py` | Work 登录（ExchangeToken 换 token，回调自动捕获，落盘 `~/.ethan/trae_work.json`） |
-| 认证 | `_auth()` / `_load_work_cred()` | 凭证加载：`.env` → Work 凭证 → 本地解密 |
-| Chat | `send_trae_chat()` | IDE 通道（3 级端点回退） |
-| Chat | `_send_trae_work_chat()` | **Work 通道**（`function=solo_work_lite` + `config_name`，已验证返回真实回复） |
-| 签到 | `fetch_checkin_status()` | 查询签到/积分状态（`/trae/api/v2/ug/checkin_credits/status`） |
-| 签到 | `claim_checkin_credits()` | 领取签到积分（`/trae/api/v2/ug/checkin_credits/claim`） |
-| 权益 | `ide_user_ent_usage` 端点 | 查询积分总额 / 已用量 / 权益包 |
-| 模型 | `_map_model()` | T1-T5 分级 + 外部名别名（`claude-sonnet-4-5` → `glm-5.2`） |
-| 错误 | `_trae_error_text()` | 14+ 个官方错误码 → 中文文案（4011 今日额度 / 1005 plan 权益不足等） |
+| 认证 | `credentials._auth()` / `_load_work_cred()` | 凭证加载：`.env` → Work 凭证 → 本地解密 |
+| Chat（原生） | `native_tools._send_native_chat()` | **默认通道**：`function=chat_v3` 直通 + 原生 tools（`parameters` 需 JSON 字符串），结构化 `tool_calls` 与 `role:"tool"` 历史回放，带真实 usage；上游按 `X-Ide-Version-Code` 逐模型门控（`WB_TRAE_IDE_VERSION_CODE` 可覆盖） |
+| Chat（兜底） | `transport.send_trae_chat()` / `_send_trae_work_chat()` | 文本协议通道（IDE 3 级端点回退 / Work `solo_work_lite`）；原生通道 4001 拒绝时自动回落（`WB_TRAE_NATIVE_TOOLS=0` 可强制全走此路） |
+| 解析 | `text_toolcall._parse_tool_calls()` / `_StreamToolCallSplitter()` | 文本协议工具调用解析（教学格式 + 泄漏闸门），仅兜底路径使用 |
+| 签到 | `benefits_api.fetch_checkin_status()` / `claim_checkin_credits()` | 查询/领取签到积分（`/trae/api/v2/ug/checkin_credits/*`） |
+| 权益 | `benefits_api.fetch_ent_usage()` | 查询积分总额 / 已用量 / 权益包 |
+| 模型 | `config._map_model()` | T1-T5 分级 + 外部名别名 |
+| 错误 | `sse._trae_error_text()` | 14+ 个官方错误码 → 中文文案（4011 今日额度 / 1005 plan 权益不足等） |
 
 ## 免责声明
 

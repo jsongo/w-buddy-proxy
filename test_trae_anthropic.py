@@ -94,8 +94,14 @@ def trae_env(monkeypatch):
         return SSE_TOOL_CALL if state._tool_mode else SSE_PLAIN
 
     state._tool_mode = False
-    monkeypatch.setattr(tp, "send_trae_chat", fake_send)
-    monkeypatch.setattr(tp, "_auth", lambda: ("fake-token", "fake-uid"))
+    # 拆分后 send_trae_chat/_auth 在 trae.provider 命名空间内被调用，
+    # monkeypatch 必须 patch 使用处所在模块（mock 语义），shim 不再是 lookup 点
+    from buddy_proxy.trae import provider as _trae_provider_impl
+    monkeypatch.setattr(_trae_provider_impl, "send_trae_chat", fake_send)
+    monkeypatch.setattr(_trae_provider_impl, "_auth", lambda: ("fake-token", "fake-uid"))
+    # 本文件验证文本协议路径（教学 + 文本解析）；原生 function calling 通道
+    # 的离线测试见 test_trae_native_tools.py
+    monkeypatch.setattr(_trae_provider_impl, "_NATIVE_TOOLS_ENABLED", False)
     return state, calls
 
 
