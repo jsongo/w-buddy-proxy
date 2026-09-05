@@ -47,15 +47,20 @@ c4 = '配置如下：\n{"name": "deepseek-chat", "arguments": {"model": "v3"}, "
 rest, calls = _parse_tool_calls(c4, KNOWN)
 check("裸JSON: 未知name不误伤", len(calls) == 0 and "deepseek-chat" in rest, f"rest={rest!r}")
 
-# 5. 安全性：杂键 → 不误伤
+# 5. 杂键：行首 + 已知工具名 + 完整对象 → 闸门补收为调用（旧行为是
+#    保留为正文，实际是泄漏；杂键被忽略）
 c5 = '{"name": "shell", "arguments": {"command": "ls"}, "extra": 1}'
 rest, calls = _parse_tool_calls(c5, KNOWN)
-check("裸JSON: 杂键不误伤", len(calls) == 0 and "extra" in rest)
+check("裸JSON: 杂键由闸门补收", len(calls) == 1 and rest == ""
+      and json.loads(calls[0]["function"]["arguments"])["command"] == "ls",
+      f"calls={len(calls)} rest={rest!r}")
 
-# 6. 安全性：缺 arguments → 不误伤
+# 6. 裸名字 {"name": "shell"}：行首 + 已知工具 → 闸门补收为空参调用
 c6 = '{"name": "shell"}'
 rest, calls = _parse_tool_calls(c6, KNOWN)
-check("裸JSON: 缺arguments不误伤", len(calls) == 0)
+check("裸JSON: 裸名字闸门补收", len(calls) == 1 and rest == ""
+      and json.loads(calls[0]["function"]["arguments"]) == {},
+      f"calls={len(calls)} rest={rest!r}")
 
 # 7. 安全性：不传 known_tools → 完全不启用裸解析
 c7 = '{"name": "shell", "arguments": {"command": "ls"}}'
@@ -129,10 +134,12 @@ cx2 = "\x3ctool_action name='shell' command='ls -la' /\x3e"
 rest, calls = _parse_tool_calls(cx2, KNOWN)
 check("XML属性: 单引号", len(calls) == 1)
 
-# 18. XML 属性：未闭合标签保留原文（流式截断 flush 场景）
+# 18. XML 属性：未闭合标签随闸门清理丢弃（2026-09-05 起：损坏标签壳属
+#     协议残骸，连属性值一并清掉，不再保留为正文）
 cx3 = '文字 \x3ctool_call name="shell" command="未完结'
 rest, calls = _parse_tool_calls(cx3, KNOWN)
-check("XML属性: 未闭合保留", len(calls) == 0 and "未完结" in rest)
+check("XML属性: 未闭合清理", len(calls) == 0 and "未完结" not in rest
+      and "tool_call" not in rest and "文字" in rest, f"rest={rest!r}")
 
 # 19. XML 属性：流式跨 chunk 分裂
 sp = _StreamToolCallSplitter(KNOWN)
@@ -194,10 +201,16 @@ if calls:
     ab = json.loads(calls[0]["function"]["arguments"])
     check("引号修复: 值含}命令完整", ab.get("command") == 'echo "}" 2>/dev/null; ls', f"args={ab}")
 
-# 27. 彻底破碎、无法定位边界：优雅降级（不崩溃、不误修、正文保留）
+# 27. 尾部截断（流断在字符串中间）：截断修复补闭合引号 + 括号，打捞成调用
+#     （旧行为是整段保留为正文 = 泄漏）
 broken = '{"name": "shell", "arguments": {"command": "ls 未闭合'
 rest, calls = _parse_tool_calls(broken, KNOWN)
-check("引号修复: 不可修复降级保留", len(calls) == 0 and "未闭合" in rest, f"rest={rest!r}")
+check("截断修复: 字符串内截断打捞", len(calls) == 1
+      and calls[0]["function"]["name"] == "shell" and rest == "",
+      f"calls={len(calls)} rest={rest!r}")
+if calls:
+    ab = json.loads(calls[0]["function"]["arguments"])
+    check("截断修复: 半截参数保留", ab.get("command") == "ls 未闭合", f"args={ab}")
 
 # 28. 冒号连写形态（glm-5.3 实测）：web_searchquery: <自由文本>，
 #     连续两个时上一个值与下一个标记粘连，尾随 markdown --- 分隔线
