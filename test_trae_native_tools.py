@@ -291,3 +291,56 @@ def test_native_non_4001_error_no_fallback(client, native_env):
     assert r.status_code == 502
     assert "4031" in r.json().get("detail", "") or "4031" in r.text
     assert legacy_calls == []
+
+
+# ---------------------------------------------------------------------------
+# 原生通道瞬态重试（对齐 Work 通道语义）
+# ---------------------------------------------------------------------------
+def test_native_transient_retry(monkeypatch):
+    """上游瞬态断流（IncompleteRead）→ 同端点退避重试，第二次成功。"""
+    import http.client
+    from buddy_proxy.trae import native_tools as nt
+
+    attempts = {"n": 0}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b"event: done\ndata: {}\n\n"
+
+    def flaky_urlopen(req, timeout):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise http.client.IncompleteRead(b"partial")
+        return _Resp()
+
+    monkeypatch.setattr(nt, "_load_work_cred",
+                        lambda: {"access_token": "fake", "uid": "u"})
+    monkeypatch.setattr("urllib.request.urlopen", flaky_urlopen)
+    monkeypatch.setattr(nt.time, "sleep", lambda sec: None)
+
+    raw = nt._send_native_chat(
+        [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        "glm-5.3", False,
+        [{"type": "function", "function": {"name": "f", "description": "",
+                                           "parameters": "{}"}}])
+    assert "event: done" in raw
+    assert attempts["n"] == 2
+
+
+def test_native_shim_getattr_compat():
+    """历史任意名字经 shim __getattr__ 从子包解析（旧代码不断链）。"""
+    import buddy_proxy.trae_provider as tp_shim
+    from buddy_proxy.trae import leak_guard
+
+    assert tp_shim._WORK_CHAT_MAX_ATTEMPTS == 3
+    # 历史私有常量/辅助函数经 __getattr__ 从子包解析（与旧单体同名同值）
+    assert tp_shim._LEAK_TAG_NAMES == leak_guard._LEAK_TAG_NAMES
+    assert callable(tp_shim._gate_tool_name)
+    with pytest.raises(AttributeError):
+        tp_shim._definitely_not_a_name

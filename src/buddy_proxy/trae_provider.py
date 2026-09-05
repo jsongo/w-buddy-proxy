@@ -80,5 +80,27 @@ from .trae.transport import (  # noqa: F401
     send_trae_chat,
 )
 
+_SUBMODULES = ("config", "auth_storage", "benefits_api", "credentials", "leak_guard",
+               "text_toolcall", "text_protocol", "native_tools", "transport",
+               "sse", "provider", "cli")
+
+
+def __getattr__(name: str):
+    """兜底再导出：显式清单之外的历史名字（私有常量/辅助函数等）从子包解析。
+
+    保证旧代码对 trae_provider.<任意历史顶层名字> 的读取/patch 不断链。
+    """
+    import importlib
+
+    for sub in _SUBMODULES:
+        try:
+            mod = importlib.import_module(f"{__package__}.trae.{sub}")
+        except ImportError:
+            continue
+        if hasattr(mod, name):
+            return getattr(mod, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 if __name__ == "__main__":
     _cli()
