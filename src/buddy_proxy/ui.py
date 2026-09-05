@@ -392,7 +392,8 @@ def _ms(started: float) -> int:
 
 @app.get("/ui", response_class=HTMLResponse)
 async def ui_page():
-    return _PAGE_HTML
+    # no-cache：页面随代码更新，别让浏览器拿旧缓存（管理页无性能顾虑）
+    return HTMLResponse(content=_PAGE_HTML, headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/")
