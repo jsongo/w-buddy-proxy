@@ -34,14 +34,38 @@ KNOWN_PROVIDERS = ("codebuddy", "trae", "zcode", "doubao")
 
 def _login_codebuddy(open_browser: bool = True) -> int:
     """CodeBuddy（copilot.tencent.com）浏览器 OAuth 登录。"""
-    from buddy_proxy.codebuddy_client_demo import CodeBuddyClient
+    import json
+
+    from buddy_proxy.codebuddy_client_demo import CodeBuddyClient, CodeBuddyError
 
     endpoint = os.getenv("CODEBUDDY_ENDPOINT", "https://copilot.tencent.com")
     client = CodeBuddyClient(endpoint)
-    client.login(open_browser=open_browser)
-
-    auth = client.session.get("auth") or {}
-    account = client.session.get("account") or {}
+    # login() 只落盘 session 文件、不更新内存 session，且浏览器超时会静默返回。
+    # 因此以「文件前后快照是否变化」判定登录是否真的完成：直接读内存旧会话
+    # 会把超时误判成成功（旧 session 里还留着死 token），或把首登误判成失败。
+    try:
+        before = client.session_file.read_bytes()
+    except FileNotFoundError:
+        before = b""
+    try:
+        client.login(open_browser=open_browser)
+    except CodeBuddyError as exc:
+        print(f"[!] 登录失败: {exc}", file=sys.stderr)
+        return 1
+    try:
+        after = client.session_file.read_bytes()
+    except FileNotFoundError:
+        after = b""
+    if not after or after == before:
+        print("[!] 登录未完成：浏览器授权超时或被取消，请重试", file=sys.stderr)
+        return 1
+    try:
+        session = json.loads(after)
+    except json.JSONDecodeError:
+        print("[!] 登录成功但 session 文件解析失败", file=sys.stderr)
+        return 1
+    auth = session.get("auth") or {}
+    account = session.get("account") or {}
     if not auth.get("accessToken"):
         print("[!] 登录流程结束但 session 中没有 accessToken", file=sys.stderr)
         return 1
@@ -49,7 +73,7 @@ def _login_codebuddy(open_browser: bool = True) -> int:
     print(f"[OK] CodeBuddy 登录成功（{endpoint}）")
     if account.get("nickname") or account.get("uid"):
         print(f"    账号: {account.get('nickname') or ''} uid={account.get('uid')}")
-    print("    会话已写入 ~/.codebuddy-session.json")
+    print(f"    会话已写入 {client.session_file}")
     return 0
 
 
