@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# proxy.sh - manage the w-buddy-proxy (buddy_proxy) FastAPI server
+# proxy.sh - manage the buddy-proxy (buddy_proxy) FastAPI server
 #
 # Usage:
 #   ./proxy.sh start    [-p PORT] [-H HOST]     # 后台启动 (默认 0.0.0.0:8787，局域网可访问)
@@ -88,7 +88,7 @@ cmd_start() {
     # 清理残留 pid
     [[ -f "$PID_FILE" ]] && rm -f "$PID_FILE"
 
-    log "starting w-buddy-proxy on $PROXY_HOST:$PROXY_PORT ..."
+    log "starting buddy-proxy on $PROXY_HOST:$PROXY_PORT ..."
     # nohup + & : 立刻返回，不阻塞
     # 走源文件 src/ 运行，避开本机 setuptools env 的 EEXIST 环境 bug（uv sync 构建可编辑安装时触发）
     PYTHONPATH="$SCRIPT_DIR/src" \

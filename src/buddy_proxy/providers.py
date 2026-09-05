@@ -1,6 +1,6 @@
 """Provider 抽象层。
 
-workbuddy2api 现在支持多个上游源（CodeBuddy、豆包等），每个源是一个
+buddy-proxy 现在支持多个上游源（CodeBuddy、豆包等），每个源是一个
 Provider 实现。Provider 负责两件事：
 
 1. 认证（各自的登录态管理，互不干扰）
