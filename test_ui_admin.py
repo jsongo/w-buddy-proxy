@@ -24,7 +24,7 @@ from buddy_proxy import __main__ as m
 from buddy_proxy import state as st
 from buddy_proxy import settings as settings_mod
 from buddy_proxy.benefits import BenefitsManager, CheckinHistory
-from buddy_proxy.metrics import MetricsCollector
+from buddy_proxy.metrics import MetricsCollector, SSEUsageExtractor, normalize_usage
 from buddy_proxy.providers import BaseProvider
 from buddy_proxy.zcode_provider import _quota_items
 
@@ -251,7 +251,8 @@ def test_metrics_persist_and_reload(tmp_path):
     path = tmp_path / "metrics.jsonl"
     m1 = MetricsCollector(path)
     m1.record(provider="zcode", model="glm-5.3", protocol="openai",
-              status=200, duration_ms=120, prompt_tokens=7, completion_tokens=9)
+              status=200, duration_ms=120, prompt_tokens=7, completion_tokens=9,
+              ttft_ms=45, cached_tokens=3, credit=0.5)
     m1.record(provider="trae", model="glm-5.2", protocol="openai",
               status=429, duration_ms=30, error="rate limited")
     # 模拟重启：重新加载同一个文件
@@ -261,6 +262,59 @@ def test_metrics_persist_and_reload(tmp_path):
     assert by_model[("zcode", "glm-5.3")]["count"] == 1
     assert by_model[("zcode", "glm-5.3")]["completion_tokens"] == 9
     assert by_model[("trae", "glm-5.2")]["errors"] == 1
+    # TTFT / 缓存 / 积分 在最近请求明细里
+    rec = next(r for r in snap["recent"] if r["model"] == "glm-5.3")
+    assert rec["ttft_ms"] == 45 and rec["cached_tokens"] == 3 and rec["credit"] == 0.5
+
+
+# ---------------------------------------------------------------------------
+# 流式 usage 提取（SSE）
+# ---------------------------------------------------------------------------
+def test_sse_usage_extractor_openai():
+    """CodeBuddy/OpenAI 形态：usage 在末尾 chunk 一次性给。"""
+    ex = SSEUsageExtractor()
+    ex.feed(b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n')
+    ex.feed(b'data: {"choices":[],"usage":{"prompt_tokens":18,"completion_tokens":2,'
+            b'"prompt_tokens_details":{"cached_tokens":9},"credit":0.35}}\n\n')
+    ex.feed(b"data: [DONE]\n\n")
+    assert ex.usage == {"prompt_tokens": 18, "completion_tokens": 2,
+                        "cached_tokens": 9, "credit": 0.35}
+
+
+def test_sse_usage_extractor_anthropic_and_split_lines():
+    """Anthropic 形态（input/output 分事件）+ usage 行跨 chunk 断开。"""
+    ex = SSEUsageExtractor()
+    ex.feed(b'event: message_start\ndata: {"message":{"usage":{"input_tokens":120,'
+            b'"cache_read_input_tokens":30}}}\n\n')
+    # 故意把 usage 行从中间劈开
+    ex.feed(b'event: message_delta\ndata: {"usage":{"output_tok')
+    ex.feed(b'ens": 55}}\n\n')
+    assert ex.usage["prompt_tokens"] == 120
+    assert ex.usage["completion_tokens"] == 55
+    assert ex.usage["cached_tokens"] == 30
+
+
+def test_metrics_record_ttft_and_credit_in_recent(env):
+    env.state.metrics.record(provider="fakeprov", model="fake-model",
+                             stream=True, status=200, duration_ms=900,
+                             ttft_ms=180, prompt_tokens=50, completion_tokens=20,
+                             cached_tokens=10, credit=1.5)
+    snap = env.state.metrics.snapshot()
+    recent = snap["recent"][0]
+    assert recent["ttft_ms"] == 180
+    assert recent["cached_tokens"] == 10
+    assert recent["credit"] == 1.5
+
+
+def test_normalize_usage_shapes():
+    n = normalize_usage({"prompt_tokens": 10, "completion_tokens": 5,
+                         "prompt_tokens_details": {"cached_tokens": 4}, "credit": 0.2})
+    assert n == {"prompt_tokens": 10, "completion_tokens": 5,
+                 "cached_tokens": 4, "credit": 0.2}
+    a = normalize_usage({"input_tokens": 8, "output_tokens": 3,
+                         "cache_read_input_tokens": 2})
+    assert a == {"prompt_tokens": 8, "completion_tokens": 3,
+                 "cached_tokens": 2, "credit": None}
 
 
 def test_metrics_daily_series_zero_filled(tmp_path):

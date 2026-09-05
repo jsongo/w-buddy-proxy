@@ -200,8 +200,14 @@ async def ui_stats(request: Request):
     state = get_state()
     metrics = getattr(state, "metrics", None)
     if metrics is None:
-        return {"models": [], "daily": [], "recent": [], "summary": {}}
-    return metrics.snapshot(days=14)
+        return {"models": [], "daily": [], "recent": [], "summary": {}, "credits_map": {}}
+    snap = metrics.snapshot(days=14)
+    # 模型 → 积分倍率（CodeBuddy 计费口径；其他通道无倍率概念）
+    snap["credits_map"] = {
+        m["id"]: m.get("credits")
+        for m in load_models_from_local_config() if m.get("credits")
+    }
+    return snap
 
 
 @app.get("/ui/api/benefits")
@@ -591,11 +597,11 @@ _PAGE_HTML = r"""<!DOCTYPE html>
       <div class="chart-card"><div id="chart-models"></div></div>
     </div>
 
-    <h2>最近请求 <span class="sub">最多 50 条，进程内滚动</span></h2>
+    <h2>最近请求 <span class="sub">最多 50 条，进程内滚动；TTFT 为首 token 延迟（流式）</span></h2>
     <div class="chart-card" style="padding: 4px 8px;">
       <table>
-        <thead><tr><th>时间</th><th>通道</th><th>模型</th><th>协议</th><th class="num">耗时</th><th class="num">Tokens</th><th>状态</th></tr></thead>
-        <tbody id="recent"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
+        <thead><tr><th>时间</th><th>通道 · 模型</th><th>协议</th><th class="num">TTFT</th><th class="num">总耗时</th><th class="num">Tokens</th><th class="num">积分</th><th>状态</th></tr></thead>
+        <tbody id="recent"><tr><td colspan="8" class="empty">加载中…</td></tr></tbody>
       </table>
     </div>
   </section>
@@ -1010,16 +1016,28 @@ function renderGroups() {
 function renderRecent() {
   const rows = STATS.recent || [];
   const el = document.getElementById('recent');
-  if (!rows.length) { el.innerHTML = '<tr><td colspan="7" class="empty">还没有请求记录</td></tr>'; return; }
+  if (!rows.length) { el.innerHTML = '<tr><td colspan="8" class="empty">还没有请求记录</td></tr>'; return; }
+  const cmap = STATS.credits_map || {};
   el.innerHTML = rows.slice(0, 50).map(r => {
     const bad = (r.status >= 400 || r.error);
+    const ttft = r.ttft_ms != null ? fmtMs(r.ttft_ms) : '—';
+    const hasTok = (r.prompt_tokens || r.completion_tokens || r.cached_tokens);
+    let tok = '—', tokTitle = '';
+    if (hasTok) {
+      const cacheTxt = r.cached_tokens ? ` · 缓存 ${fmtNum(r.cached_tokens)}` : '';
+      tok = `↑${fmtNum(r.prompt_tokens)} ↓${fmtNum(r.completion_tokens)}`;
+      tokTitle = `prompt ${r.prompt_tokens} · completion ${r.completion_tokens}${cacheTxt}`;
+    }
+    const creditTxt = r.credit != null ? r.credit
+                    : cmap[r.model] ? cmap[r.model] : null;
     return `<tr>
       <td class="mono muted">${fmtTime(r.ts)}</td>
-      <td><i style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${pcolor(r.provider)};margin-right:6px"></i>${esc(r.provider)}</td>
-      <td class="mono">${esc(r.model)}</td>
-      <td class="muted">${esc(r.protocol || '')}${r.stream ? ' ⚡' : ''}</td>
+      <td><i style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${pcolor(r.provider)};margin-right:6px"></i><span class="mono">${esc(r.model)}</span></td>
+      <td class="muted" style="font-size:12px">${esc(r.protocol || '')}${r.stream ? ' ⚡' : ''}</td>
+      <td class="num mono">${r.ttft_ms != null ? ttft : '—'}</td>
       <td class="num mono">${r.duration_ms ? fmtMs(r.duration_ms) : '—'}</td>
-      <td class="num mono muted">${(r.prompt_tokens || r.completion_tokens) ? (r.prompt_tokens + '+' + r.completion_tokens) : '—'}</td>
+      <td class="num mono" title="${esc(tokTitle)}">${tok}${r.cached_tokens ? ` <span class="tag">缓 ${fmtNum(r.cached_tokens)}</span>` : ''}</td>
+      <td class="num mono">${r.credit != null ? `<b style="color:var(--ok)">${r.credit}</b>` : (creditTxt ? `<span class="tag" title="该模型积分倍率（上游未提供单次实际消耗）">${esc(creditTxt)}</span>` : '—')}</td>
       <td>${bad ? `<span class="tag bad" title="${esc(r.error || '')}">${r.status || 'ERR'}</span>` : '<span class="tag ok">OK</span>'}</td>
     </tr>`;
   }).join('');

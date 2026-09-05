@@ -20,6 +20,7 @@ from fastapi import HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from buddy_proxy.dsml_parser import DSMLStreamBuffer
+from buddy_proxy.metrics import SSEUsageExtractor, normalize_usage
 from buddy_proxy.providers import BaseProvider
 from buddy_proxy.state import (
     diagnostic,
@@ -324,11 +325,15 @@ async def _instrument(
             error = str((payload.get("error") or {}).get("message") or f"HTTP {resp.status_code}")
     except Exception:
         pass
+    norm = normalize_usage(usage) if usage else {
+        "prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0, "credit": None}
     metrics.record(
         provider=provider_id, model=model_id, protocol=protocol,
         status=resp.status_code, duration_ms=_elapsed_ms(started),
-        prompt_tokens=usage.get("prompt_tokens") or 0,
-        completion_tokens=usage.get("completion_tokens") or 0,
+        prompt_tokens=norm["prompt_tokens"],
+        completion_tokens=norm["completion_tokens"],
+        cached_tokens=norm["cached_tokens"],
+        credit=norm["credit"],
         error=error,
     )
     return resp
@@ -336,20 +341,31 @@ async def _instrument(
 
 async def _metrics_stream(inner, metrics, *, provider_id: str, model_id: str,
                           protocol: str, started: float):
-    """流式响应的计数包装：透传所有 chunk，结束时（含异常/断开）补记一条。"""
+    """流式响应的计数包装：透传所有 chunk，结束时补记（含 TTFT 与流式 usage）。"""
     chunk_count = 0
     error = ""
+    first_ts: float | None = None
+    extractor = SSEUsageExtractor()
     try:
         async for chunk in inner:
+            if first_ts is None:
+                first_ts = time.time()
             chunk_count += 1
+            extractor.feed(chunk)
             yield chunk
     except Exception as exc:
         error = f"stream error: {exc}"
         raise
     finally:
+        u = extractor.usage
         metrics.record(provider=provider_id, model=model_id, protocol=protocol,
                        status=500 if error else 200, duration_ms=_elapsed_ms(started),
-                       stream=True, chunk_count=chunk_count, error=error)
+                       stream=True, chunk_count=chunk_count, error=error,
+                       ttft_ms=round((first_ts - started) * 1000) if first_ts else None,
+                       prompt_tokens=u.get("prompt_tokens", 0),
+                       completion_tokens=u.get("completion_tokens", 0),
+                       cached_tokens=u.get("cached_tokens", 0),
+                       credit=u.get("credit"))
 
 
 async def forward_chat(

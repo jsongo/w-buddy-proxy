@@ -31,6 +31,65 @@ def _date_str(ts: float) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(ts))
 
 
+def normalize_usage(u: dict[str, Any]) -> dict[str, Any]:
+    """把 OpenAI / CodeBuddy / Anthropic 三种 usage 形态归一化。
+
+    - prompt/completion：Anthropic 叫 input/output_tokens
+    - 缓存：OpenAI 在 prompt_tokens_details.cached_tokens，Anthropic 是
+      cache_read_input_tokens，CodeBuddy 三处都有
+    - credit：CodeBuddy usage 里的单次积分消耗（其他上游没有 → None）
+    """
+    details = u.get("prompt_tokens_details") or {}
+    credit = u.get("credit")
+    return {
+        "prompt_tokens": int(u.get("prompt_tokens") or u.get("input_tokens") or 0),
+        "completion_tokens": int(u.get("completion_tokens") or u.get("output_tokens") or 0),
+        "cached_tokens": int(u.get("cached_tokens") or details.get("cached_tokens")
+                             or u.get("cache_read_input_tokens") or 0),
+        "credit": float(credit) if credit is not None else None,
+    }
+
+
+class SSEUsageExtractor:
+    """从上游 SSE 字节流里轻量提取 token usage 与 credit。
+
+    兼容 OpenAI（usage 在末尾 chunk 一次性给）与 Anthropic
+    （message_start 给 input、message_delta 累计 output）两种形态；
+    跨 chunk 断行由内部缓冲处理；只对包含 "usage" 的行做 JSON 解析，
+    高吞吐流的开销可忽略。
+    """
+
+    def __init__(self) -> None:
+        self._buf = b""
+        self.usage: dict[str, Any] = {}
+
+    def feed(self, chunk: bytes) -> None:
+        if b"usage" not in chunk and not self._buf:
+            return
+        self._buf += chunk
+        lines = self._buf.split(b"\n")
+        self._buf = lines.pop()  # 最后一段可能是残行，留给下一个 chunk
+        for line in lines:
+            line = line.strip()
+            if b'"usage"' not in line:
+                continue
+            if line.startswith(b"data:"):
+                line = line[5:].strip()
+            try:
+                payload = json.loads(line)
+            except Exception:
+                continue
+            u = payload.get("usage")
+            if not isinstance(u, dict):
+                u = (payload.get("message") or {}).get("usage")
+            if not isinstance(u, dict):
+                continue
+            for k, v in normalize_usage(u).items():
+                # Anthropic 的 output_tokens 逐事件累计，取 max 即最终值
+                cur = self.usage.get(k)
+                self.usage[k] = v if cur is None else max(cur, v or 0)
+
+
 class MetricsCollector:
     """线程安全的请求指标收集器。"""
 
@@ -58,6 +117,9 @@ class MetricsCollector:
         completion_tokens: int = 0,
         error: str = "",
         chunk_count: int = 0,
+        ttft_ms: Optional[int] = None,
+        cached_tokens: int = 0,
+        credit: Optional[float] = None,
     ) -> None:
         ts = time.time()
         rec = {
@@ -67,9 +129,12 @@ class MetricsCollector:
             "protocol": protocol,
             "status": int(status),
             "duration_ms": int(duration_ms),
+            "ttft_ms": int(ttft_ms) if ttft_ms is not None else None,
             "stream": bool(stream),
             "prompt_tokens": int(prompt_tokens or 0),
             "completion_tokens": int(completion_tokens or 0),
+            "cached_tokens": int(cached_tokens or 0),
+            "credit": credit,
             "chunk_count": int(chunk_count or 0),
             "error": (error or "")[:300],
         }
