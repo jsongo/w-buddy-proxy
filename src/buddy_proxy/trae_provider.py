@@ -62,6 +62,18 @@ X_APP_ID = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
 _TRAE_APP_VERSION = "0.2.0"
 _TRAE_APP_VERSION_CODE = "20260901"
 
+# X-Ide-Version-Code 单独可调（默认 20260906）：2026-09 实测上游按这个头逐模型
+# 门控能力——20260401 下新一代模型（glm-5.3 / kimi-k2.7-code / qwen3.8-max 等）
+# 在 chat_v3 上整表 4001；glm-5.3 的放行阈值实测落在 20260801~20260815 之间，
+# kimi-k2.7-code / Doubao-Seed-2.1-Pro 20260725 即放行。上游会持续按模型发布
+# 节奏抬阈值，此值要跟随真实 Trae 客户端版本更新（可用环境变量覆盖）。
+_TRAE_IDE_VERSION_CODE = os.environ.get("WB_TRAE_IDE_VERSION_CODE", "20260906")
+
+# 原生 function calling 通道（2026-09 实测全模型可用，glm-5-turbo 除外——不在
+# chat_v3 通道，自动走文本协议兜底）。WB_TRAE_NATIVE_TOOLS=0 可整体关闭。
+_NATIVE_TOOLS_ENABLED = os.environ.get("WB_TRAE_NATIVE_TOOLS", "1").lower() not in ("0", "false", "off")
+_NATIVE_FUNCTION = os.environ.get("WB_TRAE_NATIVE_FUNCTION", "chat_v3")
+
 # 3 级端点回退（与 trae-local-api 一致）
 ENDPOINTS = [
     "/api/agent/v3/llm_utils_chat",
@@ -375,6 +387,23 @@ def claim_checkin_credits(token: str = "", account_id: str = "") -> dict[str, An
     return _post_ug("/trae/api/v2/ug/checkin_credits/claim", token, account_id)
 
 
+def fetch_ent_usage(token: str = "", account_id: str = "") -> dict[str, Any]:
+    """查询权益/额度用量（ide_user_ent_usage：总额度 + 权益包列表）。"""
+    if not token:
+        token, _ = _auth()
+    headers = _build_checkin_headers(token, account_id)
+    headers["X-User-Region"] = "CN"
+    req = urllib.request.Request(
+        _UG_API_HOST + "/trae/api/v2/pay/ide_user_ent_usage",
+        data=b"{}", headers=headers, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Trae usage [{e.code}]: {e.read().decode()[:300]}")
+
+
 # ───────────────────────── Trae API 调用 ─────────────────────────
 
 def _build_headers(token: str, user_id: str) -> dict[str, str]:
@@ -396,7 +425,7 @@ def _build_headers(token: str, user_id: str) -> dict[str, str]:
         "X-App-Id": X_APP_ID,
         "X-App-Version": "default",
         "X-Ide-Version": _TRAE_APP_VERSION,
-        "X-Ide-Version-Code": _TRAE_APP_VERSION_CODE,
+        "X-Ide-Version-Code": _TRAE_IDE_VERSION_CODE,
         "X-App-Version-Code": _TRAE_APP_VERSION_CODE,
         "X-Ide-Version-Type": "stable",
         "X-Device-Type": "windows",
@@ -2232,6 +2261,32 @@ def _parse_tool_calls(
     return rest.strip(), calls
 
 
+def _content_blocks(content: Any) -> list[dict[str, Any]]:
+    """OpenAI content -> Trae block 数组，保留 image_url 等多模态 block。
+
+    上游 llm_utils_chat 认 OpenAI 风格的 image_url block（data URL 实测
+    glm-5.3-flash 能读图），此前把 content 拍平成纯文本导致图片被静默
+    丢弃、模型回答"没有看到图片"。
+    """
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    parts: list[dict[str, Any]] = []
+    if isinstance(content, list):
+        for p in content:
+            if not isinstance(p, dict):
+                continue
+            ptype = p.get("type")
+            if ptype == "text":
+                if p.get("text"):
+                    parts.append({"type": "text", "text": p.get("text", "")})
+            elif ptype == "image_url":
+                iu = p.get("image_url")
+                url = iu.get("url") if isinstance(iu, dict) else iu
+                if url:
+                    parts.append({"type": "image_url", "image_url": {"url": url}})
+    return parts or [{"type": "text", "text": ""}]
+
+
 def _extract_prompt(
     messages: list[dict[str, Any]],
     guard: bool = True,
@@ -2259,29 +2314,8 @@ def _extract_prompt(
     teaching = _build_tools_system(tools) if tools else ""
 
     def _content_parts(content: Any) -> list[dict[str, Any]]:
-        """OpenAI content -> Trae block 数组，保留 image_url 等多模态 block。
+        return _content_blocks(content)
 
-        上游 llm_utils_chat 认 OpenAI 风格的 image_url block（data URL 实测
-        glm-5.3-flash 能读图），此前把 content 拍平成纯文本导致图片被静默
-        丢弃、模型回答"没有看到图片"。
-        """
-        if isinstance(content, str):
-            return [{"type": "text", "text": content}]
-        parts: list[dict[str, Any]] = []
-        if isinstance(content, list):
-            for p in content:
-                if not isinstance(p, dict):
-                    continue
-                ptype = p.get("type")
-                if ptype == "text":
-                    if p.get("text"):
-                        parts.append({"type": "text", "text": p.get("text", "")})
-                elif ptype == "image_url":
-                    iu = p.get("image_url")
-                    url = iu.get("url") if isinstance(iu, dict) else iu
-                    if url:
-                        parts.append({"type": "image_url", "image_url": {"url": url}})
-        return parts or [{"type": "text", "text": ""}]
 
     for m in messages:
         role = m.get("role", "user")
@@ -2398,6 +2432,36 @@ def send_trae_chat(
     raise HTTPException(status_code=502, detail=f"trae all endpoints failed: {last_error}")
 
 
+def _work_headers(work: dict[str, Any]) -> dict[str, str]:
+    """Work (SOLO) 通道完整请求头（traework2api headers.go 实测值）。
+
+    关键：必须带 User-Agent: Trae/<ver> + X-Ide-Token 等 SOLO 专属头，
+    缺 UA 会被服务端当异常客户端限流（4011）。
+    """
+    machine_id = work.get("machine_id") or uuid.uuid4().hex
+    device_id = work.get("device_id") or hashlib.sha256(machine_id.encode()).hexdigest()[:32]
+    return {
+        "Content-Type": "application/json",
+        "User-Agent": f"Trae/{_TRAE_APP_VERSION}",
+        "Authorization": f"Cloud-IDE-JWT {work['access_token']}",
+        "X-Cloudide-Token": work["access_token"],
+        "X-Ide-Token": work["access_token"],
+        "X-Uid": work.get("uid") or "",
+        "X-App-Id": X_APP_ID,
+        "X-App-Version": "default",
+        "X-Ide-Version": _TRAE_APP_VERSION,
+        "X-Ide-Version-Code": _TRAE_IDE_VERSION_CODE,
+        "X-App-Version-Code": _TRAE_APP_VERSION_CODE,
+        "X-Ide-Version-Type": "stable",
+        "X-Device-Type": "windows",
+        "X-OS-Version": "Windows 11 Pro",
+        "X-Device-Brand": "83DG",
+        "Request-Traffic-Type": "prod",
+        "X-Machine-Id": machine_id,
+        "X-Device-Id": device_id,
+    }
+
+
 def _send_trae_work_chat(
     messages: list[dict[str, Any]],
     model: str,
@@ -2411,37 +2475,15 @@ def _send_trae_work_chat(
       （缺 UA 会被服务端当异常客户端限流 4011）
     - host 用 mchost.guru（AgentHost），签到/积分才用 api.trae.cn
     """
-    token = work["access_token"]
-    uid = work.get("uid") or ""
-
     trae_model = _map_model(model)
     body = _build_chat_body(messages, trae_model, stream)
     # 绝大多数模型走 solo_work_lite；少数（glm-5.1 / Doubao-Seed-Code 等）
     # 在该 function 下 4001，需改走 chat_v3（实测）
     body["function"] = _WORK_FUNCTION_OVERRIDE.get(trae_model, "solo_work_lite")
 
-    machine_id = work.get("machine_id") or uuid.uuid4().hex
-    device_id = work.get("device_id") or hashlib.sha256(machine_id.encode()).hexdigest()[:32]
     headers = {
-        "Content-Type": "application/json",
+        **_work_headers(work),
         "Accept": "text/event-stream" if stream else "application/json",
-        "User-Agent": f"Trae/{_TRAE_APP_VERSION}",
-        "Authorization": f"Cloud-IDE-JWT {token}",
-        "X-Cloudide-Token": token,
-        "X-Ide-Token": token,
-        "X-Uid": uid,
-        "X-App-Id": X_APP_ID,
-        "X-App-Version": "default",
-        "X-Ide-Version": _TRAE_APP_VERSION,
-        "X-Ide-Version-Code": _TRAE_APP_VERSION_CODE,
-        "X-App-Version-Code": _TRAE_APP_VERSION_CODE,
-        "X-Ide-Version-Type": "stable",
-        "X-Device-Type": "windows",
-        "X-OS-Version": "Windows 11 Pro",
-        "X-Device-Brand": "83DG",
-        "Request-Traffic-Type": "prod",
-        "X-Machine-Id": machine_id,
-        "X-Device-Id": device_id,
     }
 
     url = f"{BASE_URL_CN}/api/agent/v3/llm_utils_chat"
@@ -2489,6 +2531,205 @@ def _send_trae_work_chat(
         status_code=502,
         detail=f"trae work chat failed after {_WORK_CHAT_MAX_ATTEMPTS} attempts: {last_error}",
     )
+
+
+# ───────────────────────── 原生 function calling 通道 ─────────────────────────
+#
+# 2026-09 实测：llm_utils_chat 本身就是 raw-chat（chat_v3 的 timing 事件名即
+# llm_raw_chat_v2），原生支持 OpenAI 风格 tools。此前走"提示词教学 + 文本解析"
+# 是因为版本头停在 20260401，新一代模型全被上游按版本门控拒成 4001，误判为
+# "上游不支持原生 tools 参数"。版本头提上去之后：
+#   - tools 形状：{type:"function", function:{name, description, parameters}}，
+#     parameters 必须是 JSON **字符串**（Go schema 反序列化错误实测确认）；
+#   - 响应流 event:output 直接带 tool_calls：[{index, id, type:"function",
+#     function_call:{name, arguments}}]，按 index 增量合并（OpenAI delta 风格，
+#     字段名是 function_call 不是 function）；reasoning_content 独立字段；
+#   - 多轮历史可结构化回放：assistant 带 tool_calls、role:"tool" 带
+#     tool_call_id，上游原生认识（实测模型正确读取工具结果续答）；
+#   - 覆盖面：17 个模型 16 个原生可用（唯一例外 glm-5-turbo 不在 chat_v3
+#     通道，靠下方 4001 兜底自动回落文本协议）；
+#   - tool_choice：只收字符串（auto/required/none/工具名都过校验），但语义
+#     未验证（'none' 下模型仍会调工具），因此暂不透传。
+
+def _native_rejected(raw: str) -> bool:
+    """判断原生通道响应是否为上游参数拒绝（应回落文本协议）。
+
+    拒绝有两种壳：HTTP 400 + JSON 体（{"code":4001,...}），或 HTTP 200 +
+    SSE error 事件（event:error / data:{"code":4001,...}）。二者都统一由
+    本函数识别。其他错误码（鉴权 1001、限流 4011 等）不回落——文本协议
+    同样会失败，原样上报更有诊断价值。
+    """
+    if not raw:
+        return False
+    if raw.lstrip().startswith("{"):
+        try:
+            return str(json.loads(raw).get("code")) == "4001"
+        except Exception:
+            return False
+    try:
+        for event, data in _parse_sse(raw):
+            if event == "error" and str((data or {}).get("code")) == "4001":
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _native_tools_payload(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """OpenAI tools 定义 -> 原生通道 tools 数组（parameters 序列化成 JSON 字符串）。"""
+    out: list[dict[str, Any]] = []
+    for t in tools or []:
+        if not isinstance(t, dict) or not t:
+            continue
+        fn = t["function"] if isinstance(t.get("function"), dict) else t
+        name = fn.get("name") or t.get("name")
+        if not name:
+            continue
+        params = fn.get("parameters") or t.get("parameters") or {"type": "object", "properties": {}}
+        if not isinstance(params, str):
+            params = json.dumps(params, ensure_ascii=False)
+        out.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": fn.get("description") or t.get("description") or "",
+                "parameters": params,
+            },
+        })
+    return out
+
+
+def _native_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """OpenAI messages -> 原生通道 messages（结构化历史，不做文本协议改写）。
+
+    与 _extract_prompt 的关键差异：assistant.tool_calls 保持结构化
+    （function_call 形状，2026-09 实测上游原生认识），role:tool 结果保持
+    tool 角色 + tool_call_id，不转 user + [tool_result] 前缀。
+    """
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        role = m.get("role", "user")
+        content = _content_blocks(m.get("content"))
+        tool_calls = m.get("tool_calls") if isinstance(m, dict) else None
+        if role == "assistant" and tool_calls:
+            tcs: list[dict[str, Any]] = []
+            for j, c in enumerate(tool_calls):
+                fn = c.get("function") if isinstance(c.get("function"), dict) else c
+                args = fn.get("arguments", "")
+                if not isinstance(args, str):
+                    args = json.dumps(args or {}, ensure_ascii=False)
+                tcs.append({
+                    "index": j,
+                    "id": c.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+                    "type": "function",
+                    "function_call": {"name": fn.get("name") or "", "arguments": args},
+                })
+            # content 为空也要带空 text block（上游 schema 要求；实测空串即可）
+            out.append({"role": "assistant", "content": content, "tool_calls": tcs})
+        elif role in ("tool", "function"):
+            out.append({
+                "role": "tool",
+                "tool_call_id": m.get("tool_call_id") or "",
+                "name": m.get("name") or "tool",
+                "content": content,
+            })
+        else:
+            out.append({"role": role, "content": content})
+    return out
+
+
+def _build_native_body(
+    native_msgs: list[dict[str, Any]], trae_model: str, stream: bool,
+    tools: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    session_id = str(uuid.uuid4())
+    return {
+        "messages": native_msgs,
+        "model": trae_model,
+        "config_name": trae_model,
+        "function": _NATIVE_FUNCTION,
+        "stream": stream,
+        "request_id": session_id,
+        "session_id": session_id,
+        "tools": _native_tools_payload(tools),
+    }
+
+
+def _send_native_chat(
+    native_msgs: list[dict[str, Any]], model: str, stream: bool,
+    tools: list[dict[str, Any]] | None,
+) -> str:
+    """原生通道发送：Work 凭证优先，回退 IDE 凭证；返回原始 SSE/错误文本。
+
+    HTTP 400（Go schema 拒绝的另一种壳）原样返回文本，交给调用方
+    _native_rejected 判定回落，不在这里抛——文本协议兜底是对 4001 的
+    正确响应，抛异常会跳过兜底。
+    """
+    trae_model = _map_model(model)
+    body = _build_native_body(native_msgs, trae_model, stream, tools)
+    work = _load_work_cred()
+    if work and work.get("access_token"):
+        headers = _work_headers(work)
+    else:
+        token, user_id = _auth()
+        headers = _build_headers(token, user_id)
+    headers = {
+        **headers,
+        "Accept": "text/event-stream" if stream else "application/json",
+    }
+    url = f"{BASE_URL_CN}/api/agent/v3/llm_utils_chat"
+    req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
+                                 headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")[:2000]
+        if e.code == 400:
+            return detail or '{"code":4001}'
+        raise HTTPException(status_code=502, detail=f"trae native chat failed: {e.code} {detail}")
+
+
+class _NativeToolAccumulator:
+    """按 index 合并原生通道流式 tool_calls 分片。
+
+    上游分片语义（实测）：首事件可能携带完整调用（id/name/arguments 一次给全），
+    后续事件按 index 追加——新调用以"非空 id"宣告，name 随后的非空分片到达，
+    arguments 非空分片为**追加**而非替换（观测到 '{"c' 这样的残片）。空串
+    字段一律忽略。
+    """
+
+    def __init__(self) -> None:
+        self._calls: dict[int, dict[str, str]] = {}
+
+    def feed(self, items: Any) -> None:
+        for tc in items or []:
+            if not isinstance(tc, dict):
+                continue
+            try:
+                idx = int(tc.get("index") or 0)
+            except (TypeError, ValueError):
+                idx = 0
+            fc = tc.get("function_call") if isinstance(tc.get("function_call"), dict) else {}
+            call = self._calls.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+            if tc.get("id"):
+                call["id"] = tc["id"]
+            if fc.get("name"):
+                call["name"] = fc["name"]
+            if fc.get("arguments"):
+                call["arguments"] += fc["arguments"]
+
+    def finish(self) -> list[dict[str, Any]]:
+        """输出 OpenAI chat.completion 形状的 tool_calls（含 index，按序排列）。"""
+        return [
+            {
+                "index": i,
+                "id": c["id"] or f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {"name": c["name"], "arguments": c["arguments"]},
+            }
+            for i, c in sorted(self._calls.items())
+        ]
 
 
 # ───────────────────────── 认证 ─────────────────────────
@@ -2669,6 +2910,8 @@ def _wrap_anthropic_stream(
 class TraeProvider(BaseProvider):
     id = "trae"
     name = "Trae (本地解密直连)"
+    # 打卡/积分 API 只有 Trae 上游提供（/ui 自动打卡据此识别）
+    supports_checkin = True
 
     def __init__(self, base_url: str | None = None, edition: str = "cn"):
         self._base_url = base_url or BASE_URL_CN
@@ -2707,6 +2950,62 @@ class TraeProvider(BaseProvider):
     def ensure_auth(self) -> None:
         _auth()
 
+    # ---- 打卡 / 额度（/ui 管理页消费，均经 asyncio.to_thread 调用） ----
+
+    def checkin_status(self) -> dict[str, Any] | None:
+        data = fetch_checkin_status()
+        checked_in = bool(data.get("checked_in"))
+        return {
+            "checked_in": checked_in,
+            "claimable": bool(data.get("enable", True)) and not checked_in,
+            "inactive": not bool(data.get("enable", True)),
+            "message": data.get("message", ""),
+        }
+
+    def checkin_claim(self) -> dict[str, Any] | None:
+        data = claim_checkin_credits()
+        if data.get("code") not in (0, None):
+            raise RuntimeError(data.get("message") or json.dumps(data, ensure_ascii=False)[:200])
+        return {
+            "checked_in": True,
+            "extra_credits": data.get("credits_granted", data.get("extra_credits")),
+            "message": data.get("message", ""),
+        }
+
+    def quota(self) -> dict[str, Any] | None:
+        data = fetch_ent_usage()
+        us = data.get("usage_summary", {})
+        items: list[dict[str, Any]] = []
+        total, consumed = us.get("total_amount"), us.get("consumed_amount")
+        if total is not None:
+            ratio = us.get("consumption_ratio")
+            percent = round(ratio * 100) if isinstance(ratio, (int, float)) else None
+            remaining = None
+            if isinstance(total, (int, float)) and isinstance(consumed, (int, float)):
+                remaining = round(total - consumed, 2)
+            items.append({"label": "总额度", "used": consumed, "total": total,
+                          "remaining": remaining, "percent": percent, "reset_ts": None})
+        # 权益包列表可能带几十条历史"签到奖励"空记录，只保留有到期时间的前几个
+        packs: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for p in data.get("user_entitlement_pack_list", []):
+            eb = p.get("entitlement_base_info") or {}
+            if not eb.get("end_time"):
+                continue
+            desc = p.get("display_desc") or "权益包"
+            if desc in seen:
+                continue
+            seen.add(desc)
+            packs.append({
+                "label": desc,
+                "used": None, "total": None, "percent": None,
+                "reset_ts": eb.get("end_time"),
+            })
+            if len(packs) >= 3:
+                break
+        items.extend(packs)
+        return {"items": items, "level": None}
+
     async def forward(
         self,
         body: dict[str, Any],
@@ -2728,11 +3027,19 @@ class TraeProvider(BaseProvider):
         )
 
         tools = body.get("tools") or []
+        # 原生 function calling 通道：带 tools 的请求优先走结构化直通
+        # （chat_v3 + 原生 tools），上游 4001 拒绝时自动回落文本协议。
+        # prompt（文本协议转换）始终照算——它是兜底路径的输入。
+        native_mode = bool(tools) and _NATIVE_TOOLS_ENABLED
         prompt = _extract_prompt(
             messages, guard=not agent_mode, tools=tools if agent_mode else None
         )
         if not prompt:
             raise HTTPException(status_code=400, detail="no text content")
+        native = (
+            {"messages": _native_messages(messages), "tools": tools}
+            if native_mode else None
+        )
 
         if stream:
             include_usage = bool(
@@ -2743,7 +3050,7 @@ class TraeProvider(BaseProvider):
                 include_usage = True
             gen = self._stream(prompt, requested_model,
                                sanitize=not agent_mode, tools=tools or None,
-                               include_usage=include_usage)
+                               include_usage=include_usage, native=native)
             if protocol == "anthropic":
                 gen = _wrap_anthropic_stream(gen, requested_model)
             return StreamingResponse(
@@ -2755,7 +3062,8 @@ class TraeProvider(BaseProvider):
         # 避免阻塞事件循环拖垮所有并发请求
         try:
             collected = await asyncio.to_thread(
-                self._collect, prompt, requested_model, not agent_mode, tools or None
+                self._collect, prompt, requested_model, not agent_mode, tools or None,
+                native,
             )
         except HTTPException as e:
             # anthropic 协议错误体用标准形状（Claude Code 等 SDK 靠它渲染错误）
@@ -2776,6 +3084,7 @@ class TraeProvider(BaseProvider):
         self, messages: list[dict[str, Any]], model: str, sanitize: bool = True,
         tools: list[dict[str, Any]] | None = None,
         include_usage: bool = False,
+        native: dict[str, Any] | None = None,
     ) -> AsyncIterator[str]:
         """把 Trae SSE 转成 OpenAI chat.completion.chunk 流。"""
         request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
@@ -2830,14 +3139,33 @@ class TraeProvider(BaseProvider):
 
             def _read_upstream() -> None:
                 try:
-                    _ev_q.put(("raw", send_trae_chat(
-                        messages, model, stream=True, base_url=self._base_url)))
+                    if native is not None:
+                        raw_text = _send_native_chat(
+                            native["messages"], model, stream=True,
+                            tools=native["tools"])
+                        used = True
+                        if _native_rejected(raw_text):
+                            log.warning(
+                                "trae native tools rejected (4001), "
+                                "fallback to text protocol: model=%s", model)
+                            _debug_dump("trae_native_fallback", model=model,
+                                        phase="stream")
+                            raw_text = send_trae_chat(
+                                messages, model, stream=True,
+                                base_url=self._base_url)
+                            used = False
+                        _ev_q.put(("raw", (raw_text, used)))
+                    else:
+                        _ev_q.put(("raw", (send_trae_chat(
+                            messages, model, stream=True,
+                            base_url=self._base_url), False)))
                 except BaseException as e:  # noqa: BLE001 — 原样转主线程抛出
                     _ev_q.put(("error", e))
 
             threading.Thread(target=_read_upstream, daemon=True,
                              name="trae-sse-reader").start()
             raw: str | None = None
+            used_native = False
             _waited = 0
             while raw is None:
                 try:
@@ -2852,10 +3180,14 @@ class TraeProvider(BaseProvider):
                     continue
                 if kind == "error":
                     raise payload
-                raw = payload
-            cleaner = _StreamLeakCleaner() if sanitize else None
+                raw, used_native = payload
+            acc = _NativeToolAccumulator() if used_native else None
+            cleaner = (
+                _StreamLeakCleaner() if sanitize and not used_native else None
+            )
             splitter = (
-                _StreamToolCallSplitter(_tool_names(tools)) if tools else None
+                _StreamToolCallSplitter(_tool_names(tools))
+                if tools and not used_native else None
             )
             dbg_parts: list[str] = []
             for event, data in _parse_sse(raw):
@@ -2867,7 +3199,17 @@ class TraeProvider(BaseProvider):
                     if data.get("reasoning_content"):
                         in_thinking = True
                         yield chunk({"reasoning_content": data["reasoning_content"]})
-                    if data.get("response"):
+                    if acc is not None:
+                        # 原生通道：tool_calls 按结构化事件累积，正文不经
+                        # 清洗/分流（无 agent 预设，没有可泄漏的协议语法）
+                        if data.get("tool_calls"):
+                            acc.feed(data["tool_calls"])
+                        text = data.get("response") or ""
+                        if text:
+                            dbg_parts.append(text)
+                            yield chunk({"role": "assistant", "content": text})
+                            in_thinking = False
+                    elif data.get("response"):
                         text = data["response"]
                         if cleaner is not None:
                             text = cleaner.feed(text)
@@ -2900,7 +3242,15 @@ class TraeProvider(BaseProvider):
 
         finish = "stop"
         dbg_calls: list[dict[str, Any]] = []
-        if cleaner is not None:
+        if used_native:
+            calls = acc.finish()
+            if calls:
+                finish = "tool_calls"
+                dbg_calls = calls
+                # OpenAI 流式协议：tool_call 必须带 index（客户端靠它合并分片），
+                # 首个 delta 带 role；不带 index 会被部分解析器直接丢弃
+                yield chunk({"role": "assistant", "tool_calls": calls})
+        elif cleaner is not None:
             tail = cleaner.flush()
             if tail:
                 dbg_parts.append(tail)
@@ -2935,36 +3285,71 @@ class TraeProvider(BaseProvider):
     def _collect(
         self, messages: list[dict[str, Any]], model: str, sanitize: bool = True,
         tools: list[dict[str, Any]] | None = None,
+        native: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """非流式：聚合 Trae SSE 成完整响应。"""
         reasoning_parts: list[str] = []
         content_parts: list[str] = []
+        usage_real: dict[str, Any] | None = None
 
-        raw = send_trae_chat(messages, model, stream=False, base_url=self._base_url)
+        if native is not None:
+            raw = _send_native_chat(
+                native["messages"], model, stream=False, tools=native["tools"])
+            used_native = True
+            if _native_rejected(raw):
+                log.warning(
+                    "trae native tools rejected (4001), "
+                    "fallback to text protocol: model=%s", model)
+                _debug_dump("trae_native_fallback", model=model, phase="collect")
+                raw = send_trae_chat(messages, model, stream=False,
+                                     base_url=self._base_url)
+                used_native = False
+        else:
+            raw = send_trae_chat(messages, model, stream=False,
+                                 base_url=self._base_url)
+            used_native = False
+        acc = _NativeToolAccumulator() if used_native else None
         for event, data in _parse_sse(raw):
             if event == "error":
                 raise HTTPException(
                     status_code=502,
                     detail=_trae_error_text(data),
                 )
+            if event == "token_usage":
+                u = data or {}
+                try:
+                    usage_real = {
+                        "prompt_tokens": int(u.get("prompt_tokens") or 0),
+                        "completion_tokens": int(u.get("completion_tokens") or 0),
+                        "total_tokens": int(u.get("total_tokens") or 0),
+                    }
+                except (TypeError, ValueError):
+                    usage_real = None
             if event == "output":
                 if data.get("reasoning_content"):
                     reasoning_parts.append(data["reasoning_content"])
                 if data.get("response"):
                     content_parts.append(data["response"])
+                if acc is not None and data.get("tool_calls"):
+                    acc.feed(data["tool_calls"])
 
         reasoning = "".join(reasoning_parts)
         content = "".join(content_parts)
         # 无 tools 请求也必须有初始值——下方 _debug_dump 无条件引用
         # （实测缺失时非流式无 tools 请求直接 UnboundLocalError -> internal error）
         tool_calls: list[dict[str, Any]] = []
-        # 顺序关键：带 tools 的请求必须先解析、后清洗——_sanitize_agent_leak
-        # 会把 <tool_call>/</arg_value> 标签全剥掉，先清洗再解析会让解析器
-        # 拿到被拆掉结构的残骸（实测 glm-5.3 函数调用表达式因此整段漏进正文）
-        if tools:
-            content, tool_calls = _parse_tool_calls(content, _tool_names(tools))
-        if sanitize:
-            content = _sanitize_agent_leak(content)
+        if used_native:
+            # 原生通道：tool_calls 来自结构化事件；无 agent 预设，正文没有
+            # 可泄漏的协议语法，不做解析/清洗
+            tool_calls = acc.finish()
+        else:
+            # 顺序关键：带 tools 的请求必须先解析、后清洗——_sanitize_agent_leak
+            # 会把 <tool_call>/</arg_value> 标签全剥掉，先清洗再解析会让解析器
+            # 拿到被拆掉结构的残骸（实测 glm-5.3 函数调用表达式因此整段漏进正文）
+            if tools:
+                content, tool_calls = _parse_tool_calls(content, _tool_names(tools))
+            if sanitize:
+                content = _sanitize_agent_leak(content)
         _debug_dump("debug_trae_response", model=model, stream=False, content=content,
                     tool_calls=len(tool_calls))
         # 只有 tool_calls 没有正文也是合法响应（agent 直接发起调用），
@@ -2992,7 +3377,8 @@ class TraeProvider(BaseProvider):
                 },
                 "finish_reason": "tool_calls" if tool_calls else "stop",
             }],
-            "usage": {
+            # 原生通道带真实 token_usage；文本协议上游不吐 usage，沿用旧启发式
+            "usage": usage_real or {
                 "prompt_tokens": 0,
                 "completion_tokens": max(1, len(content.encode("utf-8")) // 4),
                 "total_tokens": 0,
@@ -3048,15 +3434,7 @@ def _cli() -> None:
             if not token:
                 print("Trae 未认证：请先运行 trae_work_login.py 登录，或设置 TRAE_TOKEN 环境变量")
                 return
-        headers = _build_headers(token, uid)
-        headers["Accept"] = "application/json"
-        headers["X-User-Region"] = "CN"
-        req = urllib.request.Request(
-            _UG_API_HOST + "/trae/api/v2/pay/ide_user_ent_usage",
-            data=b"{}", headers=headers, method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        data = fetch_ent_usage(token, uid)
         us = data.get("usage_summary", {})
         print(f"总额度: {us.get('total_amount')} | 已用: {us.get('consumed_amount')} "
               f"({us.get('consumption_ratio', 0) * 100:.1f}%)")

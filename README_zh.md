@@ -9,6 +9,7 @@
 ## 特性
 
 - **协议转换** — `/v1/chat/completions`(OpenAI)、`/v1/responses`(Codex CLI)、`/v1/messages`(Anthropic / Claude Code)
+- **管理界面** — 内置 Web 控制台 `/ui`：按 provider 分组管理模型、一键「设为默认启用模型」、每个模型一键测试（发条 hi）、按模型维度聚合请求统计图表
 - **模型列表** — `/v1/models` 返回 OpenAI 兼容的模型列表，附带每个模型的完整元数据（上下文窗口、能力）
 - **脱敏**（`--desensitize`）— 向 system 消息里的合规关键词插入零宽空格，避免后端关键词审核误拦
 - **消息压缩**（`--optimize-context`）— 压缩长历史 / 大 schema / 超大工具输出，大幅降低 token 消耗
@@ -35,7 +36,29 @@ uv run python -m buddy_proxy --desensitize
 uv run python -m buddy_proxy --login --desensitize
 ```
 
-默认监听 `http://127.0.0.1:8787`。
+默认监听 `http://127.0.0.1:8787`，管理界面在 **http://127.0.0.1:8787/ui**。
+
+### `buddy` 命令（推荐）
+
+`buddy` 是日常使用的入口：一条命令启动 + 自动打开管理页，也可以把代理注册成 macOS 系统服务（launchd，登录自启 + 崩溃自动拉起）。
+
+```bash
+./buddy start              # 启动（未运行时）并打开 http://127.0.0.1:8787/ui
+./buddy stop / restart / status / logs
+./buddy login [provider]   # 登录上游账号（codebuddy(=workbuddy)/trae/zcode/doubao）
+./buddy ui                 # 仅打开管理页（必要时先启动）
+
+# 一次性安装：把 buddy 放进 PATH，之后任意目录敲 buddy 即可
+./buddy install            # 装到 /usr/local/bin（不可写时退回 ~/.local/bin）
+
+# 注册为系统服务（launchd）：登录自启、崩溃自动拉起
+./buddy service install    # 之后 start/stop/restart 自动走 launchctl
+./buddy service status
+./buddy service uninstall
+```
+
+- 有系统服务时 `buddy start/stop/restart` 自动转 `launchctl`，否则走 `proxy.sh` 的 pid 管理
+- 环境变量 `PROXY_HOST`（默认 0.0.0.0）、`PROXY_PORT`（默认 8787）、`PROXY_EXTRA_ARGS` 对 `start` 与 `service install` 生效
 
 ### 豆包 Provider（可选）
 
@@ -84,9 +107,9 @@ uv run trae-cli chat -m glm-5.2 -q "你好"    # 发一条对话测试
 认证自动加载：优先 Work 凭证 `~/.ethan/trae_work.json`（`trae_work_login.py` 登录生成），
 其次解密本机 Trae IDE `storage.json`，无需手动配置 token。
 
-### 用 `proxy.sh` 后台管理（推荐）
+### 用 `proxy.sh` 后台管理
 
-常驻后台运行时不用阻塞终端：
+`buddy` 内部即调用 `proxy.sh`；想手动精细控制时可以直接用它：
 
 ```bash
 ./proxy.sh start          # 后台启动，立刻返回
@@ -94,6 +117,7 @@ uv run trae-cli chat -m glm-5.2 -q "你好"    # 发一条对话测试
 ./proxy.sh restart        # 重启
 ./proxy.sh status         # 显示 PID 和监听地址
 ./proxy.sh logs           # tail -F 日志
+./proxy.sh ui             # 确保在跑并打开管理页
 
 # 自定义 host / port / 额外参数
 ./proxy.sh start -p 9000 -H 0.0.0.0
@@ -108,14 +132,7 @@ PROXY_PORT=9000 PROXY_EXTRA_ARGS="--desensitize --optimize-context" ./proxy.sh s
 
 ## 模型列表
 
-`src/buddy_proxy/models_config.json` 维护了完整的静态模型列表，加 `--static-models` 可强制使用它（断网或远程同步失败时很有用）：
-
-```bash
-./proxy.sh start -- --static-models
-# (注意中间的 `--` 分隔，把参数透传给 buddy_proxy)
-```
-
-静态目录当前内置 **11 个模型**，`GET /v1/models` 的 `data[].credits` / `models[].credits` 会返回积分倍率（消费 × 倍率）：
+模型目录由 `src/buddy_proxy/models_config.json` 维护（启动时与 `/v1/models` 都从这里读取，离线可靠）。当前内置 **11 个模型**，`GET /v1/models` 的 `data[].credits` / `models[].credits` 会返回积分倍率（消费 × 倍率）：
 
 | id | name | credits |
 |---|---|---|
@@ -131,7 +148,34 @@ PROXY_PORT=9000 PROXY_EXTRA_ARGS="--desensitize --optimize-context" ./proxy.sh s
 | `deepseek-v4-flash` | Deepseek-V4-Flash | x0.17 |
 | `deepseek-v4-pro` | Deepseek-V4-Pro | x0.51 |
 
-要新增 / 调整模型，直接编辑 `src/buddy_proxy/models_config.json`，加 `--static-models` 重启即生效。
+要新增 / 调整模型，直接编辑 `src/buddy_proxy/models_config.json` 后重启即生效。
+
+## 管理界面（/ui）
+
+浏览器打开 <http://127.0.0.1:8787/ui>（或 `buddy start` / `buddy ui` 自动打开）：
+
+- **默认启用模型** — 按 provider 分组浏览所有模型，点「设为默认」即可把某个模型设为默认；
+  客户端请求**不带 `model` 字段**时自动用它补齐。设置持久化在 `~/.buddy-proxy/settings.json`
+  （可用 `BUDDY_PROXY_SETTINGS` 覆盖），重启后仍生效；启动时 `--default-model zcode/glm-5.3`
+  可提供初始值（设置文件里已有的值优先）
+- **一键测试** — 每个模型一个「测试」按钮，向上游发一条 `hi`，弹窗里返回延迟、token 用量和回复预览
+  （非流式、`max_tokens=256`，走真实上游、会产生真实调用）
+- **自动打卡 & 打卡日历** — Trae 与 CodeBuddy 上游都提供每日签到：勾选「自动打卡」后代理每天定时
+  （默认 09:30，启动时当天未签会立即补签）自动领取，最近 35 天的打卡情况在日历里展示；也可点
+  「立即打卡」手动领。签到活动有档期——CodeBuddy 档期未开时界面显示「今日无签到活动」且不会误打。
+  打卡历史逐行落在 `logs/checkin.jsonl`。ZCode（智谱 Coding Plan）/ 豆包没有签到 API
+- **额度查询** — 各通道剩余额度一目了然：CodeBuddy 积分包余额合计 + 各资源包明细（credits）；
+  Trae 总额度剩余 + 权益包到期时间；ZCode 的 5 小时 / 每周用量窗口与重置时间。额度数据带
+  5 分钟缓存，避免频繁请求上游
+- **统计图表** — 按 provider/模型维度聚合请求数、错误数、平均耗时、token 用量：
+  近 14 天按通道堆叠的柱状图、模型请求 Top 榜、最近 50 条请求明细。
+  每次请求完成追加一行到 `logs/metrics.jsonl`，重启后自动回读恢复历史（保留 30 天）
+- **通道健康** — 各 provider 的登录/配置状态一目了然（CodeBuddy 是否登录、zcode key 是否配置等）
+
+管理页里还可以切换**兜底通道**（请求未命中任何模型时的默认路由），设置持久化在同一文件。
+
+安全约定：`/ui/api/*` 管理接口**仅允许本机（127.0.0.1）访问**；确需从局域网操作管理页时设置
+`BUDDY_PROXY_ADMIN_OPEN=1` 放开（自担风险）。`/v1/*` 代理端点不受此限制。
 
 ## 快速验证
 
@@ -257,18 +301,22 @@ providers:
 --log-file PATH           JSONL 日志（默认 <项目根>/logs/buddy-proxy.jsonl，可用 BUDDY_PROXY_LOG_FILE 覆盖）
 --desensitize             启用脱敏（推荐）
 --optimize-context        启用消息压缩（Codex 场景推荐）
+--default-model MODEL     默认启用模型（如 zcode/glm-5.3）；请求未带 model 时使用，
+                          首次启动写入设置文件，此后以 ~/.buddy-proxy/settings.json 为准
 --login                   启动时浏览器登录
 --no-browser              登录时不自动打开浏览器
 --verbose-llm             记录完整请求/响应体
 --mock-dir DIR            使用录制的响应（测试用）
 ```
 
-环境变量：`BUDDY_PROXY_HOST`、`BUDDY_PROXY_PORT`、`CODEBUDDY_ENDPOINT`、`BUDDY_PROXY_LOG_FILE`。
+环境变量：`BUDDY_PROXY_HOST`、`BUDDY_PROXY_PORT`、`CODEBUDDY_ENDPOINT`、`BUDDY_PROXY_LOG_FILE`、`BUDDY_PROXY_SETTINGS`（设置文件路径）、`BUDDY_PROXY_ADMIN_OPEN=1`（放开管理接口的本机限制）。
 
 ## API 端点
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
+| GET  | `/ui`                 | 管理界面（`/` 302 跳转到 `/ui`） |
+| GET  | `/ui/api/*`           | 管理接口（overview/models/stats/benefits/settings/checkin/test，仅限本机） |
 | GET  | `/health`             | 服务 + 认证状态 |
 | GET  | `/v1/models`          | 模型列表 |
 | POST | `/v1/chat/completions` | OpenAI 对话（工具 + 流式） |
@@ -287,7 +335,7 @@ providers:
 
 | 接口 | 说明 |
 | --- | --- |
-| `GET /v1/models` | 模型列表（静态 `models_config.json` / 本地配置 / 远程动态） |
+| `GET /v1/models` | 模型列表（`models_config.json` 本地配置） |
 | `POST /v1/chat/completions` | OpenAI 对话（`stream_upstream` 流式 / `collect_upstream` 非流式） |
 | `POST /v1/responses` | Codex CLI Responses 协议适配 |
 | `POST /v1/messages` | Claude Code Anthropic Messages 协议适配 |

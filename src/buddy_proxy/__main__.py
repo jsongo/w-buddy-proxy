@@ -14,10 +14,14 @@ Usage with uv:
 
 模块结构（2026-09 拆分）：
 - ``logging_setup``  日志配置与运行时信息工具
-- ``state``          全局状态（ProxyState、app、proxy_state、remote_config_cache）
-- ``model_list``     模型列表构建（静态/本地/远程 + Codex 格式）
+- ``state``          全局状态（ProxyState、app）
+- ``model_list``     模型列表构建（本地配置 + Codex 格式）
+- ``metrics``        请求指标收集（/ui 图表数据源）
+- ``settings``       管理页设置持久化（默认启用模型等）
+- ``codebuddy_client`` 默认 CodeBuddy 上游客户端
 - ``codebuddy_provider`` 默认 CodeBuddy 上游与核心转发逻辑
-- ``routes``         所有 FastAPI 路由
+- ``routes``         所有 /v1/* 代理路由
+- ``ui``             /ui 管理页与管理接口
 - ``__main__``       本文件：仅保留启动入口 main()
 """
 
@@ -30,15 +34,19 @@ import pathlib
 import uvicorn
 from fastapi import HTTPException
 
-from buddy_proxy.codebuddy_client_demo import CodeBuddyClient
+from buddy_proxy.codebuddy_client import CodeBuddyClient
 from buddy_proxy.providers import BaseProvider
 from buddy_proxy.doubao_provider import DoubaoProvider
 from buddy_proxy.logging_setup import setup_logging, setup_json_logging
+from buddy_proxy.metrics import MetricsCollector
+from buddy_proxy.benefits import BenefitsManager
+from buddy_proxy import settings as settings_mod
 from buddy_proxy.state import ProxyState, app
-from buddy_proxy.model_list import RemoteConfigCache
+from buddy_proxy.settings import normalize_default_model
 
-# 导入 routes 以注册所有 @app 路由（副作用导入）
+# 导入 routes / ui 以注册所有 @app 路由（副作用导入）
 from buddy_proxy import routes as _routes  # noqa: F401
+from buddy_proxy import ui as _ui  # noqa: F401
 
 
 def main():
@@ -79,10 +87,10 @@ def main():
                         help="登录时不自动打开浏览器")
     parser.add_argument("--verbose-llm", action="store_true",
                         help="log full LLM request/response content (default: summary only, saves 98%% space)")
-    parser.add_argument("--static-models", action="store_true",
-                        help="使用静态模型列表（默认从远程 API 动态获取）")
-    parser.add_argument("--config-cache-ttl", type=int, default=int(os.getenv("CODEBUDDY_CONFIG_CACHE_TTL", "300")),
-                        help="远程配置缓存 TTL（秒，默认 300）")
+    parser.add_argument("--default-model", default=None,
+                        help="默认启用模型，形如 zcode/glm-5.3（或裸 glm-5.3 按路由自动匹配通道）；"
+                             "客户端请求未带 model 字段时使用。"
+                             "首次启动时写入设置文件，此后以 ~/.buddy-proxy/settings.json（管理页可改）为准")
     parser.add_argument("--doubao", action="store_true", default=os.getenv("DOUBAO_ENABLED", "") == "1",
                         help="启用豆包 provider（自研内联，直连豆包工作 App CDP）")
     parser.add_argument("--trae", action="store_true", default=os.getenv("TRAE_ENABLED", "") == "1",
@@ -147,6 +155,11 @@ def main():
     else:
         print("[Trae] Disabled (pass --trae or TRAE_ENABLED=1 to enable)")
 
+    # 管理页设置文件里的兜底通道优先于 CLI/环境变量（UI 改动跨重启生效）
+    saved_settings = settings_mod.load_settings()
+    if saved_settings.get("default_provider"):
+        args.default_provider = normalize_default_model(saved_settings["default_provider"])
+
     # 校验兜底通道：必须是 codebuddy 或已启用的 provider id
     if args.default_provider != "codebuddy" and args.default_provider not in providers:
         logger.warning(
@@ -157,6 +170,17 @@ def main():
     print(f"[Router] Default provider: {args.default_provider}")
 
     # 创建全局状态
+    # 默认模型：CLI --default-model 提供初始值；设置文件里已有的值优先
+    default_model = normalize_default_model(args.default_model or "")
+    if "default_model" in saved_settings:
+        default_model = normalize_default_model(saved_settings.get("default_model") or "")
+    if default_model and "default_model" not in saved_settings:
+        settings_mod.save_settings({"default_model": default_model})
+    if default_model:
+        print(f"[Default Model] {default_model} (settings: {settings_mod.settings_path()})")
+
+    metrics = MetricsCollector(args.log_file.parent / "metrics.jsonl")
+
     _state.proxy_state = ProxyState(
         client=client,
         mock_dir=args.mock_dir,
@@ -168,6 +192,12 @@ def main():
         json_logger=json_logger,
         providers=providers,
         default_provider=args.default_provider,
+        default_model=default_model or None,
+        metrics=metrics,
+    )
+    # 打卡管理器要引用 state 本身，构造后挂上
+    _state.proxy_state.benefits = BenefitsManager(
+        args.log_file.parent / "checkin.jsonl", _state.proxy_state
     )
     _state.proxy_state.write_log(
         "startup",
@@ -182,27 +212,14 @@ def main():
         _state.proxy_state.runtime_info["machine"],
     )
 
-    # 初始化远程配置缓存（默认启用动态模型列表）
-    if not args.static_models:
-        # 默认：动态模式
-        _state.remote_config_cache = RemoteConfigCache(
-            url=args.endpoint,
-            ttl=args.config_cache_ttl
-        )
-        logger.info(f"Dynamic model list enabled: cache_url={args.endpoint}, ttl={args.config_cache_ttl}s")
-        print(f"[Dynamic Models] Enabled (endpoint={args.endpoint}, TTL={args.config_cache_ttl}s)")
-    else:
-        # 显式禁用：静态模式
-        logger.info("Using static model list (25 models)")
-        print(f"[Static Models] Using 25 hardcoded models")
-
     # 启动信息输出到 stdout
     print(f"CodeBuddy proxy listening on http://{args.host}:{args.port}")
-    print("Endpoints: /v1/models /v1/chat/completions /v1/responses /v1/messages /health")
+    print("Endpoints: /ui /v1/models /v1/chat/completions /v1/responses /v1/messages /health")
+    print(f"Admin UI: http://127.0.0.1:{args.port}/ui")
 
     # 同时记录到日志
     logger.info(f"CodeBuddy proxy listening on http://{args.host}:{args.port}")
-    logger.info("Endpoints: /v1/models /v1/chat/completions /v1/responses /v1/messages /health")
+    logger.info("Endpoints: /ui /v1/models /v1/chat/completions /v1/responses /v1/messages /health")
 
     # 启动 uvicorn
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")

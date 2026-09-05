@@ -136,6 +136,20 @@ class CodeBuddyClient:
         except json.JSONDecodeError as exc:
             raise CodeBuddyError(f"{path} 返回的不是 JSON: {raw[:300]!r}") from exc
 
+    def api_post(self, path: str, body: Any = None, *, timeout: float = 30) -> Any:
+        """带认证的 POST（billing/meter 签到与额度等管理类接口）。
+
+        返回**未解包**的原始 envelope（{code, msg, requestId, data}），
+        由调用方按业务语义解包（签到/额度接口的 code 含义各不相同）。
+        """
+        headers = {
+            "Accept": "application/json",
+            "Accept-Language": "zh",
+            **self.auth_headers(),
+        }
+        return self._request("POST", path, headers=headers, body={} if body is None else body,
+                             timeout=timeout)
+
     def auth_headers(self, *, access: bool = True, refresh: bool = False) -> dict[str, str]:
         """构造认证 headers，模拟插件行为"""
         account = self.session.get("account") or {}

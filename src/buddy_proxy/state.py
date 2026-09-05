@@ -1,8 +1,8 @@
 """全局状态管理：ProxyState、FastAPI app 实例、以及跨模块共享的全局变量。
 
-把 ``app`` / ``proxy_state`` / ``remote_config_cache`` 三个模块级全局统一放在这里，
-其它模块（routes、codebuddy_provider、model_list）通过 ``from .state import ...`` 引用，
-避免拆分后出现循环导入。
+把 ``app`` / ``proxy_state`` 两个模块级全局统一放在这里，
+其它模块（routes、codebuddy_provider、model_list、ui）通过
+``from .state import ...`` 引用，避免拆分后出现循环导入。
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
 
-from buddy_proxy.codebuddy_client_demo import CodeBuddyClient
+from buddy_proxy.codebuddy_client import CodeBuddyClient
 from buddy_proxy.providers import BaseProvider
 from buddy_proxy.logging_setup import get_runtime_info
 
@@ -35,6 +35,9 @@ class ProxyState:
         json_logger: Optional[logging.Logger] = None,
         providers: Optional[dict[str, BaseProvider]] = None,
         default_provider: str = "codebuddy",
+        default_model: Optional[str] = None,
+        metrics: Optional[Any] = None,
+        benefits: Optional[Any] = None,
     ):
         self.client = client
         # 多 provider 支持：除默认 CodeBuddy 外的其它上游源（按 provider.id 索引）
@@ -42,6 +45,13 @@ class ProxyState:
         # 兜底通道：模型名未命中任何 provider 时转发到哪个通道
         # （"codebuddy" 走默认 CodeBuddy；或填已启用 provider 的 id，如 "trae"）
         self.default_provider = default_provider
+        # 管理页设置的「默认启用模型」，形如 "zcode/glm-5.3" 或裸 "glm-5.3"。
+        # 客户端请求未带 model 字段时用它补齐（settings.py 持久化，/ui 可改）
+        self.default_model = default_model
+        # 请求指标收集器（metrics.MetricsCollector，供 /ui 图表聚合）
+        self.metrics = metrics
+        # 打卡/额度管理器（benefits.BenefitsManager，供 /ui 打卡日历与额度展示）
+        self.benefits = benefits
         self.mock_dir = mock_dir
         self.log_file = log_file
         self.enable_desensitize = enable_desensitize
@@ -112,9 +122,6 @@ app = FastAPI(title="CodeBuddy Proxy (FastAPI)", version="2.0")
 
 # 全局状态（在 main() 中初始化）
 proxy_state: Optional[ProxyState] = None
-
-# 远程配置缓存实例（在 main() 中初始化；个人版用户不启用动态模型列表时保持 None）
-remote_config_cache: Any = None
 
 
 def _get_state_or_none() -> Optional[ProxyState]:
