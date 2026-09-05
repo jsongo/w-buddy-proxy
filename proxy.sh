@@ -7,6 +7,9 @@
 #   ./proxy.sh restart  [-p PORT] [-H HOST]     # 重启
 #   ./proxy.sh status                            # 查看状态
 #   ./proxy.sh logs                              # 跟踪日志
+#   ./proxy.sh login    [provider] [--no-browser] # 登录上游账号（默认 codebuddy；
+#                                                # provider: codebuddy(=workbuddy)/trae/zcode/doubao）
+#                                                # 登录成功后若网关在运行，需 restart 生效
 #
 # 支持环境变量（start 命令生效）：
 #   PROXY_PORT, PROXY_HOST, PROXY_EXTRA_ARGS (附加传给 python -m buddy_proxy)
@@ -167,12 +170,42 @@ cmd_logs() {
     tail -n 100 -F "$LOG_FILE"
 }
 
+cmd_login() {
+    local provider="codebuddy"
+    local extra=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            codebuddy|trae|zcode|doubao)
+                provider="$1" ;;
+            workbuddy)
+                # workbuddy 是 codebuddy 的别名（登录模块内同样会归一）
+                provider="codebuddy" ;;
+            --no-browser)
+                extra+=("$1") ;;
+            *)
+                log "未知参数: $1"
+                usage
+                ;;
+        esac
+        shift
+    done
+    if [[ "$provider" == "codebuddy" ]]; then
+        log "开始 codebuddy 登录（workbuddy 同义）..."
+    else
+        log "开始 $provider 登录..."
+    fi
+    # 登录成功与否由 python 侧返回码决定；失败时这里原样透传非零退出码
+    PYTHONPATH="$SCRIPT_DIR/src" $PYTHON_BIN -m buddy_proxy.login "$provider" \
+        ${extra[@]+"${extra[@]}"}
+}
+
 case "${1:-}" in
     start)   shift; cmd_start "$@" ;;
     stop)    cmd_stop ;;
     restart) shift; cmd_restart "$@" ;;
     status)  cmd_status ;;
     logs)    cmd_logs ;;
+    login)   shift; cmd_login "$@" ;;
     -h|--help|help|"") usage ;;
     *)       usage ;;
 esac

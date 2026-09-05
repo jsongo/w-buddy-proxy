@@ -95,6 +95,8 @@ def main():
                              "（codebuddy/zcode/trae/doubao，默认 codebuddy；可用 PROXY_DEFAULT_PROVIDER 覆盖）")
     args = parser.parse_args()
     args.log_file = args.log_file.expanduser()
+    # provider 别名归一：workbuddy 是 codebuddy 的旧称，用户配置/命令行都可能敲
+    args.default_provider = {"workbuddy": "codebuddy"}.get(args.default_provider, args.default_provider)
 
     # 设置日志
     log_dir = args.log_file.parent if args.log_file else pathlib.Path("logs")
