@@ -212,6 +212,9 @@ class MetricsCollector:
             d["by_provider"][provider] = d["by_provider"].get(provider, 0) + b["count"]
 
         # ---- 24h 汇总 + 最近请求 ----
+        # 口径限制：24h 汇总基于 recent deque（上限 MAX_RECENT 条）。24h 内请求
+        # 超过上限时会少算——「最近请求」表格同理只展示最近 50 条。对单机自用
+        # 够用；如需精确按小时分桶，需要额外状态，暂不做。
         total_24h = errors_24h = 0
         dur_sum_24h = 0
         for rec in recent:

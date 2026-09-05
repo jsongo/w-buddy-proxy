@@ -152,7 +152,8 @@ cmd_start() {
     else
         "$PROXY_SH" start
     fi
-    wait_healthy
+    # 健康检查失败（启动慢）也要继续打开 UI，不让 set -e 直接退出
+    wait_healthy || true
     open_ui
 }
 

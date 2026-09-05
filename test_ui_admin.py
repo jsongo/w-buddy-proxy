@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from types import SimpleNamespace
 from unittest import mock
@@ -332,7 +333,7 @@ def _benefits_state(tmp_path, providers):
 
 def test_checkin_history_and_manager(tmp_path):
     state, manager = _benefits_state(tmp_path, {"fakecheckin": FakeCheckinProvider()})
-    result = __import__("asyncio").run(manager.claim_now("fakecheckin"))
+    result = asyncio.run(manager.claim_now("fakecheckin"))
     assert result["ok"] is True
     # 历史落盘 + 日历今天有记录
     history = CheckinHistory(tmp_path / "checkin.jsonl")
@@ -342,7 +343,7 @@ def test_checkin_history_and_manager(tmp_path):
     assert cal[-1]["providers"] == ["fakecheckin"]
     assert cal[0]["providers"] == []
     # snapshot：done_today 且额度展示出来
-    snap = __import__("asyncio").run(manager.snapshot())
+    snap = asyncio.run(manager.snapshot())
     entry = next(p for p in snap["providers"] if p["id"] == "fakecheckin")
     assert entry["checkin"]["supported"] is True
     assert entry["checkin"]["done_today"] is True
@@ -359,7 +360,7 @@ def test_checkin_claim_upstream_error_recorded(tmp_path):
             raise RuntimeError("boom")
 
     state, manager = _benefits_state(tmp_path, {"fakeerrcheckin": ErrCheckinProvider()})
-    result = __import__("asyncio").run(manager.claim_now("fakeerrcheckin"))
+    result = asyncio.run(manager.claim_now("fakeerrcheckin"))
     assert result["ok"] is False
     history = CheckinHistory(tmp_path / "checkin.jsonl")
     assert history.entries()[-1]["ok"] is False
