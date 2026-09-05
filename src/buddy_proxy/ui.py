@@ -553,6 +553,13 @@ _PAGE_HTML = r"""<!DOCTYPE html>
            background: var(--card2); border: 1px solid var(--line); color: var(--text);
            padding: 9px 18px; border-radius: 10px; font-size: 13px; display: none; z-index: 99; }
   #toast.err { border-color: rgba(255,107,107,.5); color: #ffb3b3; }
+  #cal-tip { position: fixed; z-index: 60; display: none; pointer-events: none;
+             background: #0b0e13; border: 1px solid #2d3846; color: var(--text);
+             padding: 8px 11px; border-radius: 8px; font-size: 12px;
+             box-shadow: 0 6px 18px rgba(0,0,0,.45); min-width: 130px; }
+  #cal-tip .t-date { color: var(--muted); margin-bottom: 4px; }
+  #cal-tip .t-p { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
+  #cal-tip .t-p i { width: 8px; height: 8px; border-radius: 2px; display: inline-block; flex: none; }
 </style>
 </head>
 <body>
@@ -631,6 +638,7 @@ _PAGE_HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 <div id="toast"></div>
+<div id="cal-tip"></div>
 
 <script>
 const PCOLORS = { codebuddy: '#4f8cff', trae: '#a78bfa', zcode: '#3ecf8e', doubao: '#f0b429' };
@@ -756,9 +764,8 @@ function renderBenefits() {
 
   const cal = document.getElementById('cal');
   const days = BENEFITS.calendar || [];
-  const byDate = {};
-  days.forEach(d => byDate[d.date] = d.providers || []);
   const DOW = ['一', '二', '三', '四', '五', '六', '日'];
+  const DOW_FULL = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
   const now = new Date();
   const pad2 = n => String(n).padStart(2, '0');
   const todayStr = `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())}`;
@@ -772,10 +779,20 @@ function renderBenefits() {
     const d = days[i - padN];
     if (!d) { html += '<div class="day blank"></div>'; continue; }
     const hit = (d.providers || []).length > 0;
-    const tip = d.date + (hit ? '：' + d.providers.join(', ') : '');
-    html += `<div class="day${hit ? ' hit' : ''}${d.date === todayStr ? ' today' : ''}" title="${esc(tip)}">${Number(d.date.slice(8))}</div>`;
+    html += `<div class="day${hit ? ' hit' : ''}${d.date === todayStr ? ' today' : ''}" data-date="${d.date}">${Number(d.date.slice(8))}</div>`;
   }
   cal.innerHTML = html;
+  // 悬停 tooltip 数据：日期 + 星期 + 各通道当日领取
+  const dowOf = ds => DOW_FULL[(new Date(ds + 'T12:00:00').getDay() + 6) % 7];
+  days.forEach(d => {
+    const lines = (d.providers || []).map(pid => {
+      const credit = (d.credits || {})[pid];
+      return `<div class="t-p"><i style="background:${pcolor(pid)}"></i>${esc(pid)}${credit != null ? ` <b style="color:var(--ok)">+${esc(credit)}</b>` : ''}</div>`;
+    });
+    window._calTips[d.date] =
+      `<div class="t-date">${d.date} ${dowOf(d.date)}${d.date === todayStr ? ' · 今天' : ''}</div>` +
+      (lines.length ? lines.join('') : '<div class="t-p muted">当天未打卡</div>');
+  });
 
   const rows = (BENEFITS.providers || []).filter(p => p.checkin.supported);
   document.getElementById('checkin-rows').innerHTML = rows.length ? rows.map(p => {
@@ -919,6 +936,27 @@ document.getElementById('groups').addEventListener('click', e => {
   if (e.target.closest('.group-head') || e.target.closest('thead th')) {
     if (!e.target.closest('button')) toggleGroup(g.dataset.gid);
   }
+});
+
+// 打卡日历悬停 tooltip（自绘，即时显示：日期 + 星期 + 各通道当日领取）
+const calTip = document.getElementById('cal-tip');
+document.getElementById('cal').addEventListener('mousemove', e => {
+  const cell = e.target.closest('.day');
+  const tip = cell && !cell.classList.contains('blank')
+    && window._calTips && window._calTips[cell.dataset.date];
+  if (!tip) { calTip.style.display = 'none'; return; }
+  calTip.innerHTML = tip;
+  calTip.style.display = 'block';
+  const r = cell.getBoundingClientRect();
+  let x = r.left + r.width / 2 - calTip.offsetWidth / 2;
+  x = Math.max(8, Math.min(x, window.innerWidth - calTip.offsetWidth - 8));
+  let y = r.top - calTip.offsetHeight - 8;
+  if (y < 8) y = r.bottom + 8;
+  calTip.style.left = x + 'px';
+  calTip.style.top = y + 'px';
+});
+document.getElementById('cal').addEventListener('mouseleave', () => {
+  calTip.style.display = 'none';
 });
 
 function renderGroups() {

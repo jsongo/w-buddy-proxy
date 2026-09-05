@@ -335,12 +335,13 @@ def test_checkin_history_and_manager(tmp_path):
     state, manager = _benefits_state(tmp_path, {"fakecheckin": FakeCheckinProvider()})
     result = asyncio.run(manager.claim_now("fakecheckin"))
     assert result["ok"] is True
-    # 历史落盘 + 日历今天有记录
+    # 历史落盘 + 日历今天有记录（含当日领取积分）
     history = CheckinHistory(tmp_path / "checkin.jsonl")
     dates = history.ok_dates_by_provider()
     assert len(dates["fakecheckin"]) == 1
     cal = history.calendar(7)
     assert cal[-1]["providers"] == ["fakecheckin"]
+    assert cal[-1]["credits"] == {"fakecheckin": 50}
     assert cal[0]["providers"] == []
     # snapshot：done_today 且额度展示出来
     snap = asyncio.run(manager.snapshot())

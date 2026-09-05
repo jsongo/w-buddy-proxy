@@ -87,18 +87,32 @@ class CheckinHistory:
         return dates
 
     def calendar(self, days: int = 35) -> list[dict[str, Any]]:
-        """最近 N 天的打卡日历：[{date, providers: [...]}]，旧日期在前。"""
-        by_date: dict[str, list[str]] = {}
+        """最近 N 天的打卡日历，旧日期在前。
+
+        每天一项：``{"date", "providers": [id...], "credits": {id: 积分}}``，
+        credits 是当天实际领取的签到积分（上游签到历史合并进来的日子没有
+        本地领取记录，只有 provider 名）。
+        """
+        by_date: dict[str, dict[str, Any]] = {}
         for rec in self.entries():
-            if rec.get("ok") and rec.get("date"):
-                providers = by_date.setdefault(rec["date"], [])
-                if rec["provider"] not in providers:
-                    providers.append(rec["provider"])
+            if not (rec.get("ok") and rec.get("date")):
+                continue
+            info = by_date.setdefault(rec["date"], {"providers": [], "credits": {}})
+            pid = rec.get("provider", "")
+            if pid not in info["providers"]:
+                info["providers"].append(pid)
+            if rec.get("credits") is not None:
+                info["credits"][pid] = rec["credits"]
         today = datetime.now().date()
         out = []
         for offset in range(days - 1, -1, -1):
             date = (today - timedelta(days=offset)).isoformat()
-            out.append({"date": date, "providers": by_date.get(date, [])})
+            info = by_date.get(date, {"providers": [], "credits": {}})
+            out.append({
+                "date": date,
+                "providers": sorted(info["providers"]),
+                "credits": info["credits"],
+            })
         return out
 
 
@@ -165,18 +179,26 @@ class BenefitsManager:
             provider_entries.append(entry)
 
         # 上游直接给出的签到历史（如 CodeBuddy checkin_dates）合并进日历，
-        # 这样代理没记录过的历史打卡天也能展示
-        day_map: dict[str, set[str]] = {}
+        # 这样代理没记录过的历史打卡天也能展示（无本地领取积分记录）
+        day_map: dict[str, dict[str, Any]] = {}
         day_order: list[str] = []
         for d in self.history.calendar(35):
-            day_map[d["date"]] = set(d["providers"])
+            day_map[d["date"]] = {
+                "providers": set(d["providers"]),
+                "credits": dict(d.get("credits") or {}),
+            }
             day_order.append(d["date"])
         for entry in provider_entries:
             pid = entry["id"]
             for ds in entry["checkin"].get("checkin_dates") or []:
-                if ds in day_map:
-                    day_map[ds].add(pid)
-        calendar_out = [{"date": d, "providers": sorted(day_map[d])} for d in day_order]
+                if ds in day_map and pid not in day_map[ds]["providers"]:
+                    day_map[ds]["providers"].add(pid)
+        calendar_out = [
+            {"date": d,
+             "providers": sorted(day_map[d]["providers"]),
+             "credits": day_map[d]["credits"]}
+            for d in day_order
+        ]
 
         return {
             "providers": provider_entries,
