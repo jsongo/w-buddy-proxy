@@ -25,9 +25,9 @@ mkdir -p "$LOG_DIR"
 # 仅本机使用可显式指定：./proxy.sh start -H 127.0.0.1
 PROXY_HOST="${PROXY_HOST:-0.0.0.0}"
 PROXY_PORT="${PROXY_PORT:-8787}"
-# 默认启用 Trae（兜底通道）+ 豆包（CDP 直连）；
-# 可用 PROXY_EXTRA_ARGS 覆盖，或命令行追加参数（如 --default-provider codebuddy）
-EXTRA_ARGS="${PROXY_EXTRA_ARGS:---desensitize --trae --doubao --default-provider trae}"
+# 默认启用 ZCode（glm-* 编码通道，必须最先注册以免被 trae 截走）+ Trae（兜底通道）
+# + 豆包（CDP 直连）；可用 PROXY_EXTRA_ARGS 覆盖，或命令行追加参数（如 --default-provider codebuddy）
+EXTRA_ARGS="${PROXY_EXTRA_ARGS:---desensitize --trae --doubao --zcode --default-provider trae}"
 
 # 优先使用项目自带 .venv（uv 已装好依赖），否则退回系统 python
 if [[ -x "$SCRIPT_DIR/.venv/bin/python" ]]; then
