@@ -765,6 +765,7 @@ function renderBenefits() {
 
   const cal = document.getElementById('cal');
   const days = BENEFITS.calendar || [];
+  window._calTips = {};
   const DOW = ['一', '二', '三', '四', '五', '六', '日'];
   const DOW_FULL = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
   const now = new Date();
