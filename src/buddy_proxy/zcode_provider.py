@@ -9,8 +9,9 @@ bigmodel-coding-plan 通道同款）：
 协议与路由（与 trae/豆包 provider 的多协议约定一致）：
 - anthropic（/v1/messages）→ 直通上游 ``{base}/v1/messages``，model 名透传，
   零转换开销；响应（流式/非流式）原样回传。
-- openai（/v1/chat/completions）→ 走 GLM 原生 OpenAI 兼容端点
-  ``https://open.bigmodel.cn/api/paas/v4/chat/completions``，请求体透传；
+- openai（/v1/chat/completions）→ GLM Coding Plan 的 OpenAI 端点
+  ``https://open.bigmodel.cn/api/coding/paas/v4/chat/completions``（注意 /coding
+  前缀：标准 /api/paas/v4 按普通余额计费，Coding Plan 账户 429 1113），请求体透传；
   响应（含 SSE）原样回传。
 - responses（/v1/responses）→ 走通用链路（anthropic_adapter 转成 chat 后
   到这里，即 openai 协议路径）。
@@ -49,17 +50,24 @@ log = logging.getLogger(__name__)
 
 BIGMODEL_ANTHROPIC_BASE = "https://open.bigmodel.cn/api/anthropic"
 ZAI_ANTHROPIC_BASE = "https://api.z.ai/api/anthropic"
-BIGMODEL_OPENAI_BASE = "https://open.bigmodel.cn/api/paas/v4"
-ZAI_OPENAI_BASE = "https://api.z.ai/api/paas/v4"
+# Coding Plan 的 openai 端点带 /coding 前缀（资源包只覆盖它）；标准 /api/paas/v4
+# 按普通 API 余额计费，Coding Plan 账户打过去 429 code=1113「余额不足或无可用
+# 资源包，请充值」（2026-09 实测）。ZCODE_OPENAI_BASE 可整体覆盖。
+BIGMODEL_OPENAI_BASE = "https://open.bigmodel.cn/api/coding/paas/v4"
+ZAI_OPENAI_BASE = "https://api.z.ai/api/coding/paas/v4"
 
 
 def _openai_base_for(anthropic_base: str) -> str:
-    """由 anthropic base 推导同域 openai 兼容端点。
+    """由 anthropic base 推导同域 openai 兼容端点（Coding Plan 的 /coding 变体）。
 
     key 从 ZCode CLI 配置解析、且启用的是 zai（国际 api.z.ai）通道时，
     key 是 z.ai 域的——openai/responses 请求若还打 open.bigmodel.cn 必然
     401。anthropic 请求走 self._base 没问题，openai 端点必须同域跟随。
+    ZCODE_OPENAI_BASE 环境变量可整体覆盖（如官方未来调整端点）。
     """
+    override = os.environ.get("ZCODE_OPENAI_BASE", "").strip().rstrip("/")
+    if override:
+        return override
     host = urllib.parse.urlparse(anthropic_base).netloc.lower()
     return ZAI_OPENAI_BASE if "z.ai" in host else BIGMODEL_OPENAI_BASE
 
